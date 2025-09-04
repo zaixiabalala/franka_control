@@ -1,0 +1,38 @@
+# Franka机器人配置
+robot:
+  # 机器人IP地址
+  ip: "192.168.1.2"
+  port: 4242
+  
+  # 控制参数
+  frequency: 1000  # 控制频率 (Hz)
+  Kx_scale: 1.0    # 位置增益缩放
+  Kxd_scale: 1.0   # 速度增益缩放
+  
+  # 初始化参数
+  joints_init: null  # 初始关节位置，null表示不初始化
+  joints_init_duration: 5.0  # 初始化持续时间
+  
+  # 实时控制
+  soft_real_time: false  # 是否启用软实时
+  
+  # 调试
+  verbose: false
+
+# 共享内存配置
+shared_memory:
+  get_max_k: 5000  # 最大获取数据量
+  get_time_budget: 0.2  # 获取时间预算
+  put_desired_frequency: 1000  # 期望写入频率
+
+# 策略接口配置
+policy:
+  # 动作维度 (7个关节角度)
+  action_dim: 7
+  
+  # 观测维度
+  obs_dim: 14  # 关节位置7 + 关节速度7
+  
+  # 控制延迟补偿
+  action_latency: 0.1  # 动作延迟 (秒)
+  obs_latency: 0.0001  # 观测延迟 (秒)
