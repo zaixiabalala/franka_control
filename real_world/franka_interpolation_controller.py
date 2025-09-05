@@ -233,13 +233,18 @@ class FrankaInterpolationController(mp.Process):
     def schedule_waypoint(self, pose, target_time):
         """调度路径点"""
         pose = np.array(pose)
-        assert pose.shape == (6,)
+        assert pose.shape == (7,)
 
         message = {
             'cmd': Command.SCHEDULE_WAYPOINT.value,
             'target_pose': pose,
             'target_time': target_time
         }
+        
+        # 调试信息：检查消息发送到队列
+        print(f"[schedule_waypoint调试] 发送消息到队列: {message}")
+        print(f"[schedule_waypoint调试] 队列大小: {self.input_queue.qsize()}")
+        
         self.input_queue.put(message)
     
     # ========= 接收API =============
@@ -316,6 +321,8 @@ class FrankaInterpolationController(mp.Process):
                 t_now = time.monotonic()
                 # 使用关节插值器获取目标关节位置
                 target_joints = joint_interp(t_now)
+                # print("xxxxxxxx")
+                # print(f"[控制器调试] 目标关节: {target_joints}")
 
                 # 向机器人发送关节位置命令
                 self.robot.update_desired_joint_positions(target_joints)
@@ -336,8 +343,17 @@ class FrankaInterpolationController(mp.Process):
                     # 每个周期最多处理1个命令以保持频率
                     commands = self.input_queue.get_k(1)
                     n_cmd = len(commands['cmd'])
+                    
+                    # # 调试信息：检查队列状态
+                    # if iter_idx % 100 == 0:  # 每100次循环打印一次
+                    #     print(f"[控制器调试] 队列中有 {n_cmd} 个命令")
+                    #     if n_cmd > 0:
+                    #         print(f"[控制器调试] 命令类型: {commands['cmd']}")
+                    #         print(f"[控制器调试] 目标关节: {commands['target_pose']}")
                 except Empty:
                     n_cmd = 0
+                    if iter_idx % 100 == 0:  # 每100次循环打印一次
+                        print(f"[控制器调试] 队列为空，没有命令")
 
                 # 执行命令
                 for i in range(n_cmd):
@@ -369,11 +385,14 @@ class FrankaInterpolationController(mp.Process):
                         # 关节位置控制 - 调度目标关节位置
                         target_joints = command['target_pose']  # 现在表示关节角度
                         target_time = float(command['target_time'])
+                        # 将全局时间转换为单调时间
+                        target_time = time.monotonic() - time.time() + target_time
+                        curr_time = t_now + dt
                         joint_interp = joint_interp.schedule_waypoint(
                             joints=target_joints,
                             time=target_time,
                             max_joint_speed=2.0,  # 最大关节速度 2 rad/s
-                            curr_time=t_now,
+                            curr_time=curr_time,
                             last_waypoint_time=last_waypoint_time
                         )
                         last_waypoint_time = target_time
