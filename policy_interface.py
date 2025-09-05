@@ -9,7 +9,9 @@ from typing import Dict, Any, Optional, Callable
 from multiprocessing.managers import SharedMemoryManager
 
 from real_world.franka_interpolation_controller import FrankaInterpolationController
+from real_world.wsg_controller import WSGController
 from shared_memory import SharedMemoryRingBuffer
+from common.gripper_util import convert_gripper_encoder_to_width, limit_gripper_step
 
 
 class PolicyInterface:
@@ -29,6 +31,7 @@ class PolicyInterface:
         self.policy_fn = policy_fn
         self.shm_manager = None
         self.controller = None
+        self.gripper_controller = None
         self.is_running = False
         
     def start(self):
@@ -61,12 +64,31 @@ class PolicyInterface:
         
         self.controller.start()
         self.controller.start_wait()
+        
+        # 创建Gripper控制器（如果配置了gripper）
+        if 'gripper' in self.config:
+            gripper_config = self.config['gripper']
+            self.gripper_controller = WSGController(
+                shm_manager=self.shm_manager,
+                hostname=gripper_config['hostname'],
+                port=gripper_config['port'],
+                frequency=gripper_config['frequency'],
+                move_max_speed=gripper_config['move_max_speed'],
+                verbose=gripper_config['verbose']
+            )
+            self.gripper_controller.start()
+            self.gripper_controller.start_wait()
+        
         self.is_running = True
         
     def stop(self):
         """停止策略接口"""
         if not self.is_running:
             return
+            
+        if self.gripper_controller:
+            self.gripper_controller.stop()
+            self.gripper_controller = None
             
         if self.controller:
             self.controller.stop()
@@ -117,6 +139,30 @@ class PolicyInterface:
             raise ValueError(f"动作形状应为(7,)，实际为{action.shape}")
             
         self.controller.schedule_waypoint(action, target_time)
+    
+    def execute_gripper_action(self, gripper_encoder: float, target_time: Optional[float] = None):
+        """
+        执行gripper动作
+        
+        Args:
+            gripper_encoder: gripper编码器值
+            target_time: 目标时间，如果为None则使用当前时间+延迟
+        """
+        if not self.is_running:
+            raise RuntimeError("策略接口未启动")
+            
+        if self.gripper_controller is None:
+            return  # 如果没有gripper控制器，直接返回
+            
+        if target_time is None:
+            policy_config = self.config['policy']
+            target_time = time.time() + policy_config['action_latency']
+            
+        # 将编码器值转换为gripper宽度
+        gripper_width = convert_gripper_encoder_to_width(gripper_encoder)
+        
+        # 发送gripper命令
+        self.gripper_controller.schedule_waypoint(gripper_width, target_time)
         
     def run_policy(self, 
                    max_steps: Optional[int] = None,
@@ -148,6 +194,11 @@ class PolicyInterface:
                 
                 # 执行动作
                 self.execute_action(action)
+                
+                # 执行gripper动作（如果策略支持）
+                if hasattr(self.policy_fn, 'get_gripper_action'):
+                    gripper_action = self.policy_fn.get_gripper_action(obs)
+                    self.execute_gripper_action(gripper_action)
                 
                 # 调用回调函数
                 if step_callback:

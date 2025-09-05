@@ -242,8 +242,8 @@ class FrankaInterpolationController(mp.Process):
         }
         
         # 调试信息：检查消息发送到队列
-        print(f"[schedule_waypoint调试] 发送消息到队列: {message}")
-        print(f"[schedule_waypoint调试] 队列大小: {self.input_queue.qsize()}")
+        # print(f"[schedule_waypoint调试] 发送消息到队列: {message}")
+        # print(f"[schedule_waypoint调试] 队列大小: {self.input_queue.qsize()}")
         
         self.input_queue.put(message)
     
@@ -287,7 +287,6 @@ class FrankaInterpolationController(mp.Process):
 
             #初始化姿态
             if self.joints_init is not None:
-                print("xxxxxxxxxxxxxx...")
                 self.robot.move_to_joint_positions(
                     positions=np.asarray(self.joints_init),
                     time_to_go=self.joints_init_duration

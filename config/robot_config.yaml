@@ -19,6 +19,19 @@ robot:
   # 调试
   verbose: false
 
+# Gripper配置
+gripper:
+  # Gripper IP地址 (连接到同一个Franka服务器)
+  hostname: "192.168.1.2"
+  port: 4242
+  
+  # 控制参数
+  frequency: 30  # 控制频率 (Hz)
+  move_max_speed: 200.0  # 最大移动速度
+  
+  # 调试
+  verbose: false
+
 # 共享内存配置
 shared_memory:
   get_max_k: 5000  # 最大获取数据量

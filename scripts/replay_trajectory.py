@@ -24,6 +24,7 @@ class TrajectoryPolicy:
     
     def __init__(self, 
                  trajectory_data: np.ndarray,
+                 gripper_data: np.ndarray,
                  start_time: float,
                  data_frequency: float = 30.0):
         """
@@ -31,13 +32,16 @@ class TrajectoryPolicy:
         
         Args:
             trajectory_data: 轨迹数据 (N, 7) - 7维关节角度数据
+            gripper_data: gripper数据 (N,) - gripper编码器数据
             start_time: 开始时间
             data_frequency: 数据频率 (Hz)
         """
         self.trajectory_data = trajectory_data
+        self.gripper_data = gripper_data
         self.start_time = start_time
         self.data_frequency = data_frequency
         self.dt = 1.0 / data_frequency
+        
         
     def __call__(self, obs):
         """
@@ -71,6 +75,16 @@ class TrajectoryPolicy:
             print(f"策略调用 #{self._call_count}: 时间={current_time:.2f}s, 索引={data_index}, 动作={action}")
         
         return action
+    
+    def get_gripper_action(self, obs):
+        """获取gripper动作"""
+        current_time = time.time() - self.start_time
+        data_index = int(current_time * self.data_frequency)
+        
+        if data_index >= len(self.gripper_data):
+            data_index = len(self.gripper_data) - 1
+        
+        return self.gripper_data[data_index]
 
 
 class CorrectTrajectoryReplayer:
@@ -100,8 +114,8 @@ class CorrectTrajectoryReplayer:
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
-        # 直接加载关节数据作为轨迹数据
-        self.trajectory_data = self._load_joints_data()
+        # 直接加载关节数据和gripper数据作为轨迹数据
+        self.trajectory_data, self.gripper_data = self._load_joints_data()
         
     def _load_joints_data(self):
         """只加载关节数据，不进行转换"""
@@ -114,23 +128,31 @@ class CorrectTrajectoryReplayer:
         
         print(f"找到 {len(files)} 个轨迹文件")
         
-        # 加载关节数据
+        # 加载关节数据和gripper数据
         all_joints = []
+        all_grippers = []
         for i, f in enumerate(files):
             arr = np.load(f)
             if arr.shape[0] != 8:
                 raise ValueError(f"{f} 维度异常，期望 8，得到 {arr.shape}")
             
+            # 前7维是关节角度
             joints_deg = np.array(arr[:self.joint_dim], dtype=np.float32)
             joints_rad = np.radians(joints_deg).astype(np.float32)
             all_joints.append(joints_rad)
+            
+            # 第8维是gripper编码器值
+            gripper_encoder = float(arr[self.joint_dim])
+            all_grippers.append(gripper_encoder)
         
         all_joints = np.array(all_joints)
+        all_grippers = np.array(all_grippers)
         print(f"关节轨迹数据: {len(all_joints)} 帧")
+        print(f"Gripper轨迹数据: {len(all_grippers)} 帧")
         print(f"数据频率: {self.data_frequency}Hz")
         print(f"总时长: {len(all_joints) / self.data_frequency:.2f}s")
         
-        return all_joints
+        return all_joints, all_grippers
     
     
     def run(self):
@@ -139,11 +161,17 @@ class CorrectTrajectoryReplayer:
         print(f"策略推理频率: {self.policy_frequency}Hz")
         print(f"数据采集频率: {self.data_frequency}Hz")
         
-        # 先创建一个临时策略用于启动接口
-        temp_policy = lambda obs: np.array([0.5, 0.0, 0.3, 0.0, 0.0, 0.0])
+        # 创建轨迹策略
+        start_time = time.time()
+        policy = TrajectoryPolicy(
+            trajectory_data=self.trajectory_data,
+            gripper_data=self.gripper_data,
+            start_time=start_time,
+            data_frequency=self.data_frequency
+        )
         
         # 创建策略接口
-        interface = create_policy_interface(self.config_path, temp_policy)
+        interface = create_policy_interface(self.config_path, policy)
         
         try:
             # 启动策略接口
@@ -168,6 +196,7 @@ class CorrectTrajectoryReplayer:
             start_time = time.time()
             policy = TrajectoryPolicy(
                 trajectory_data=trajectory_data,
+                gripper_data=self.gripper_data,
                 start_time=start_time,
                 data_frequency=self.data_frequency
             )
@@ -229,6 +258,16 @@ class CorrectTrajectoryReplayer:
                     print(f"  当前时间: {current_time:.2f}s")
                     print(f"  动作: {action}")
                     raise
+                
+                # 执行gripper动作
+                try:
+                    gripper_action = policy.get_gripper_action(obs)
+                    interface.execute_gripper_action(gripper_action)
+                except Exception as e:
+                    print(f"执行gripper动作失败: {e}")
+                    print(f"  当前步数: {step}")
+                    print(f"  当前时间: {current_time:.2f}s")
+                    # 不抛出异常，继续执行
                 
                 # 进度显示
                 if step % (self.policy_frequency * 2) == 0:  # 每2秒显示一次

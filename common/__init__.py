@@ -13,6 +13,9 @@ from .pose_trajectory_interpolator import PoseTrajectoryInterpolator
 from .joint_trajectory_interpolator import JointTrajectoryInterpolator
 from .interpolation_util import get_interp1d, PoseInterpolator
 from .precise_sleep import precise_sleep, precise_wait
+from .gripper_util import (
+    convert_gripper_encoder_to_width, convert_gripper_width_to_encoder, limit_gripper_step
+)
 
 __all__ = [
     'pos_rot_to_mat', 'mat_to_pos_rot', 'pos_rot_to_pose', 'pose_to_pos_rot',
@@ -22,5 +25,6 @@ __all__ = [
     'PoseTrajectoryInterpolator',
     'JointTrajectoryInterpolator',
     'get_interp1d', 'PoseInterpolator',
-    'precise_sleep', 'precise_wait'
+    'precise_sleep', 'precise_wait',
+    'convert_gripper_encoder_to_width', 'convert_gripper_width_to_encoder', 'limit_gripper_step'
 ]

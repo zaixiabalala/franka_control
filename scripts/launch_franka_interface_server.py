@@ -5,7 +5,7 @@
 """
 
 import zerorpc
-from polymetis import RobotInterface
+from polymetis import RobotInterface, GripperInterface
 import scipy.spatial.transform as st
 import numpy as np
 import torch
@@ -14,7 +14,14 @@ class FrankaInterface:
     """Franka机器人接口，通过ZeroRPC与机器人通信"""
     
     def __init__(self):
-        self.robot = RobotInterface('localhost')
+        self.robot = RobotInterface(ip_address='localhost')
+        self.robot.go_home()
+        try:
+            self.gripper = GripperInterface(ip_address='localhost')
+            print("Gripper接口初始化成功")
+        except Exception as e:
+            print(f"Gripper接口初始化失败: {e}")
+            self.gripper = None
 
     def get_ee_pose(self):
         """获取末端执行器姿态"""
@@ -84,6 +91,40 @@ class FrankaInterface:
             print(f"正向运动学计算失败: {e}")
             # 返回默认值
             return [0.5, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0]
+    
+    def get_gripper_width(self):
+        """获取gripper当前开合宽度"""
+        if self.gripper is None:
+            return 0.04  # 默认宽度
+        
+        try:
+            state = self.gripper.get_state()
+            return float(state.width)
+        except Exception as e:
+            print(f"获取gripper宽度失败: {e}")
+            return 0.04
+    
+    def move_gripper_to_width(self, width, speed=None, force=None):
+        """移动gripper到指定宽度"""
+        if self.gripper is None:
+            print("Gripper未初始化，跳过控制")
+            return False
+        
+        try:
+            # 限制宽度范围
+            width = float(np.clip(width, 0.0, 0.08))
+            
+            # 设置默认参数
+            if speed is None:
+                speed = 0.1
+            if force is None:
+                force = 10.0
+            
+            self.gripper.goto(width=width, speed=speed, force=force)
+            return True
+        except Exception as e:
+            print(f"移动gripper失败: {e}")
+            return False
 
 def main():
     """启动ZeroRPC服务器"""
