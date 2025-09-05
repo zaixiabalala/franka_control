@@ -225,9 +225,24 @@ replayer.run()
 
 在配置文件中设置 `verbose: true` 可以启用详细日志输出。
 
+## 致谢
+
+本项目基于 [UMI (Universal Manipulation Interface)](https://github.com/UMI-Robot/universal_manipulation_interface) 项目提取和重构。
+
+### 主要改进
+- 从笛卡尔位姿控制重构为关节空间控制
+- 添加了WSG gripper控制支持
+- 简化了轨迹复现流程
+- 优化了代码结构和文档
+
+### 原始项目
+- **UMI**: Universal Manipulation Interface
+- **GitHub**: https://github.com/UMI-Robot/universal_manipulation_interface
+- **论文**: Universal Manipulation Interface: In-The-Wild Robot Teaching Without In-The-Wild Data
+
 ## 许可证
 
-本项目基于UMI项目提取，遵循相应的开源许可证。
+本项目基于UMI项目提取，遵循相应的开源许可证。请参考原始UMI项目的许可证条款。
 
 ## 贡献
 

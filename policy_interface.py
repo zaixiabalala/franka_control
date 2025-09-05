@@ -1,6 +1,11 @@
 """
 策略接口模块
 提供统一的策略控制接口，支持不同的策略实现
+
+基于UMI (Universal Manipulation Interface) 项目重构：
+- 从笛卡尔位姿控制改为关节空间控制
+- 添加了gripper控制支持
+- 优化了策略接口设计
 """
 
 import time

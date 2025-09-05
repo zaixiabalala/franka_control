@@ -16,7 +16,7 @@ Franka Control Final - 基于UMI重构的Franka机器人控制系统
 """
 
 __version__ = "1.0.0"
-__author__ = "Extracted from UMI"
+__author__ = "Based on UMI (Universal Manipulation Interface)"
 
 # 导入主要接口
 from .policy_interface import PolicyInterface, SimplePolicy, create_policy_interface
