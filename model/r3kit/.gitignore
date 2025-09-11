@@ -1,0 +1,8 @@
+.DS_Store
+*/.DS_Store
+
+__pycache__/
+
+*.egg-info/
+
+r3kit/devices/robot/flexiv/flexiv_rdk/

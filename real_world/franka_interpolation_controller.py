@@ -265,13 +265,13 @@ class FrankaInterpolationController(mp.Process):
          # 首帧对齐
         print("对齐到首帧...")
         cur_rad = self.robot.get_joint_positions()
-        target_joints = [68.82101, 40.603436, -128.58241, -121.37202, 131.0479, 115.84139, -60.55921]
-        target_joints_rad = np.radians(target_joints)
+        target_joints_rad = [-2.1321869348527853, -0.5936860169121746, 1.1673866503505355, -3.027992172362134, 1.4189840432563865, 2.127658623566947, -1.6444724013831855]
+        #target_joints_rad = np.radians(target_joints)
         
         print(f"当前关节位置: {np.degrees(cur_rad)}")
         print(f"目标关节位置: {np.degrees(target_joints_rad)}")
 
-        self.joints_init = target_joints_rad
+        self.joints_init = np.array(target_joints_rad)
 
         # 启用软实时
         if self.soft_real_time:

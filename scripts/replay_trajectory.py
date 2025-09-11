@@ -207,7 +207,7 @@ class CorrectTrajectoryReplayer:
             # 获取初始观测
             obs = interface.get_observation()
             print(f"初始关节位置: {obs['robot0_joint_pos']}")
-            print(f"初始关节速度: {obs['robot0_joint_vel']}")
+            print(f"初始Gripper宽度: {obs['robot0_gripper_width']}")
 
             # 计算总执行时间
             total_data_time = len(trajectory_data) / self.data_frequency
@@ -233,6 +233,9 @@ class CorrectTrajectoryReplayer:
                 # 获取观测
                 obs = interface.get_observation()
                 current_pos = obs['robot0_joint_pos']  # 使用关节位置
+
+                # print(f"关节位置: {obs['robot0_joint_pos']}")
+                # print(f"Gripper宽度: {obs['robot0_gripper_width']}")
                 
                 # 执行策略 (模拟模型推理)
                 action = policy(obs)
