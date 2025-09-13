@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-基于相机和ACT模型的实时推理脚本 - 重构版本
-使用与replay_trajectory相同的接口形式
+基于相机和ACT模型的实时推理脚本 - 更新版本
+适配最新版本的lerobot库
 """
 
 import os
@@ -17,13 +17,18 @@ from safetensors.torch import load_file
 import sys
 import yaml
 
-# 添加项目路径到sys.path
-project_dir = Path(__file__).parent.parent
-sys.path.append(str(project_dir))
 
-# 导入训练好的模型
-from model.lerobot.common.policies.act.configuration_act import ACTConfig
-from model.lerobot.common.policies.act.modeling_act import ACTPolicy
+# 添加项目路径到sys.path，确保优先使用项目中的lerobot库
+project_dir = Path(__file__).parent.parent
+model_lerobot_path = project_dir / "model" / "lerobot" / "src"
+sys.path.insert(0, str(model_lerobot_path))
+sys.path.insert(0, str(project_dir))  # 添加项目根目录到路径
+
+# 导入最新版本的lerobot库
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.constants import OBS_IMAGES, ACTION, OBS_STATE
 
 # 导入PolicyInterface
 from policy_interface import create_policy_interface
@@ -40,7 +45,8 @@ R3KIT_RS_AVAILABLE = True
 # D415 相机配置（与采集脚本保持一致）
 FPS = 30
 D415_CAMERAS = {   
-    "cam4": "327322062498",  
+    "cam4": "327322062498",  # 固定机位视角
+    "eih": "038522062288",   # eye-in-hand视角（需要根据实际序列号修改）
 }
 
 class CameraSystem:
@@ -48,7 +54,7 @@ class CameraSystem:
     
     def __init__(self):
         self.cameras = {}
-        self.camera_names = ["cam4"]
+        self.camera_names = ["cam4", "eih"]  # 支持双视角
         self.use_realsense = True
         
         # 与采集脚本保持一致的流配置
@@ -61,11 +67,20 @@ class CameraSystem:
             if serial is None:
                 print(f"{name} 缺少序列号，跳过")
                 continue
-            cam = D415(id=serial, depth=True, name=name)
-            self.cameras[name] = cam
+            try:
+                cam = D415(id=serial, depth=True, name=name)
+                self.cameras[name] = cam
+                print(f"成功初始化相机 {name} (序列号: {serial})")
+            except Exception as e:
+                print(f"初始化相机 {name} 失败: {e}")
+                continue
+                
         if len(self.cameras) > 0:
             self.use_realsense = True
             print(f"使用 RealSense D415，相机数量: {len(self.cameras)}")
+            print(f"可用相机: {list(self.cameras.keys())}")
+        else:
+            print("警告: 没有成功初始化任何相机")
     
     def get_image(self, cam_name):
         """获取指定相机的图像"""
@@ -102,6 +117,7 @@ class CameraSystem:
             else:
                 # 生成模拟图像作为 fallback
                 images[cam_name] = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+                print(f"警告: {cam_name} 相机图像获取失败，使用模拟图像")
         
         return images
     
@@ -124,96 +140,52 @@ class CameraSystem:
 
 
 class ACTPolicyWrapper:
-    """ACT策略包装器 - 将ACT模型包装为PolicyInterface兼容的策略"""
+    """ACT策略包装器 - 适配最新版本的lerobot库"""
     
-    def __init__(self, model_path, device="cpu", camera_system=None):
+    def __init__(self, model_path, device="cpu", camera_system=None, debug_image=False):
         self.device = torch.device(device)
         self.model_path = Path(model_path)
         self.camera_system = camera_system
+        self.debug_image = debug_image
         
         # 配置参数
         self.image_size = (224, 224)
-        self.camera_names = ["cam4"]
+        self.camera_names = ["cam4", "eih"]  # 支持双视角
         self.joint_dim = 7  # 7个关节角度（弧度）  
         self.gripper_dim = 1  # 1个夹爪开合值  
         self.action_dim = self.joint_dim + self.gripper_dim  # 总共8维  
         self.chunk_size = 32  # ACT模型的chunk大小
-        
-        # 单步预测模式，不需要chunk相关参数
         
         # 加载模型
         self.policy = self._load_policy()
         
         print(f"ACT策略初始化完成: {model_path}")
         print(f"使用设备: {self.device}")
+        print(f"支持双视角输入: 固定机位(cam4) + eye-in-hand(eih)")
+        print(f"相机系统状态: {len(self.camera_system.cameras) if self.camera_system else 0} 个相机已初始化")
     
     def _load_policy(self):
         """加载训练好的策略模型"""
         if not self.model_path.exists():
             raise FileNotFoundError(f"模型路径不存在: {self.model_path}")
         
-        # 加载配置
-        config = ACTConfig(
-            input_shapes={
-                "observation.image.color": [3, 224, 224],
-                "observation.state": [self.action_dim],
-            },
-            output_shapes={"action": [self.action_dim]},
-            chunk_size=self.chunk_size,
-            n_action_steps=1,  # 时间集成需要n_action_steps=1
-            temporal_ensemble_coeff=0.01,  # 启用时间集成加权机制
-            input_normalization_modes={
-                "observation.image.color": "min_max",
-                "observation.state": "min_max",
-            },
-            output_normalization_modes={"action": "min_max"},
+        # 使用from_pretrained加载模型(推荐方式)
+        policy = ACTPolicy.from_pretrained(
+            pretrained_name_or_path=str(self.model_path)
         )
         
-        # 需要提供统计信息用于归一化
-        dataset_stats = {
-            "observation.image.color": {"min": torch.zeros(3, 1, 1), "max": torch.ones(3, 1, 1)},
-            "observation.state": {  
-                # 前7维是关节角度(-π到π弧度)，第8维是夹爪宽度(0到0.08米)  
-                "min": torch.tensor([-3.14] * self.joint_dim + [0.0]),  
-                "max": torch.tensor([3.14] * self.joint_dim + [0.08]),  
-            },  
-            "action": {  
-                # 前7维是关节角度(-π到π弧度)，第8维是夹爪宽度(0到0.08米)  
-                "min": torch.tensor([-3.14] * self.joint_dim + [0.0]),  
-                "max": torch.tensor([3.14] * self.joint_dim + [0.08]),  
-            },  
-        }
-        
-        policy = ACTPolicy(config, dataset_stats=dataset_stats)
-        
-        try:
-            # 使用 safetensors 加载模型权重
-            state_dict = load_file(self.model_path / "model.safetensors")
-            policy.load_state_dict(state_dict)
-            print("模型权重加载成功")
-            
-            # 打印加载的统计信息用于调试
-            if hasattr(policy, 'buffer_observation_state'):
-                print(f"观测状态统计信息:")
-                print(f"  min: {policy.buffer_observation_state['min']}")
-                print(f"  max: {policy.buffer_observation_state['max']}")
-            if hasattr(policy, 'buffer_action'):
-                print(f"动作统计信息:")
-                print(f"  min: {policy.buffer_action['min']}")
-                print(f"  max: {policy.buffer_action['max']}")
-                
-        except Exception as e:
-            print(f"模型权重加载失败: {e}")
-            print("使用随机初始化")
-            
+        # 移动到指定设备
         policy.to(self.device)
-        policy.eval()
+        
+        # 打印配置信息
+        print(f"模型加载成功:")
+        print(f" 策略类型: {policy.config.type}")
+        print(f" 设备: {next(policy.parameters()).device}")
+        print(f" 时间集成系数: {policy.config.temporal_ensemble_coeff}")
+        print(f" 动作步数: {policy.config.n_action_steps}")
+        print(f" 块大小: {policy.config.chunk_size}")
         
         # 打印时间集成配置信息
-        print(f"时间集成配置:")
-        print(f"  temporal_ensemble_coeff: {policy.config.temporal_ensemble_coeff}")
-        print(f"  n_action_steps: {policy.config.n_action_steps}")
-        print(f"  chunk_size: {policy.config.chunk_size}")
         if policy.config.temporal_ensemble_coeff is not None:
             print("✅ 时间集成加权机制已启用")
             print("✅ 每次select_action都会重新推理")
@@ -223,18 +195,42 @@ class ACTPolicyWrapper:
         
         return policy
     
-    def preprocess_image(self, image):
-        """预处理图像"""
+    def preprocess_image(self, image, debug=False):
+        """预处理图像 - 与训练时保持一致：先裁剪成正方形，再缩放到目标尺寸"""
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
         
-        # 调整尺寸到 224x224
-        image = image.resize(self.image_size, Image.Resampling.LANCZOS)
+        # 获取原始图像尺寸
+        width, height = image.size
+        if debug:
+            print(f"原始图像尺寸: {width}x{height}")
         
-        # 转换为 tensor 格式 (3, H, W)
-        image_tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).float()
+        # 先裁剪成正方形（取较小的边作为边长）
+        if width > height:
+            # 宽度大于高度，从中心裁剪
+            left = (width - height) // 2
+            right = left + height
+            top = 0
+            bottom = height
+        else:
+            # 高度大于等于宽度，从中心裁剪
+            top = (height - width) // 2
+            bottom = top + width
+            left = 0
+            right = width
         
-        # 归一化到 [0, 1]
+        # 裁剪成正方形
+        image_cropped = image.crop((left, top, right, bottom))
+        if debug:
+            print(f"裁剪后尺寸: {image_cropped.size}")
+        
+        # 缩放到目标尺寸
+        image_resized = image_cropped.resize(self.image_size, Image.Resampling.LANCZOS)
+        if debug:
+            print(f"缩放后尺寸: {image_resized.size}")
+        
+        # 转换为tensor并归一化
+        image_tensor = torch.from_numpy(np.array(image_resized)).permute(2, 0, 1).float()  # (3, H, W)
         image_tensor = image_tensor / 255.0
         
         return image_tensor
@@ -260,17 +256,28 @@ class ACTPolicyWrapper:
         单步预测动作（使用 ACTPolicy.select_action）。
         返回: (8,) numpy 数组，前7维为关节(弧度)，第8维为夹爪(米)。
         """
-        # 预处理图像
-        if self.camera_names[0] in images:
-            img_tensor = self.preprocess_image(images[self.camera_names[0]])
+        # 预处理固定机位视角图像
+        if "cam4" in images:
+            color_img_tensor = self.preprocess_image(images["cam4"], debug=self.debug_image)
         else:
             # 随机图像回退
             fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            img_tensor = self.preprocess_image(fake)
+            color_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
+            print("警告: 固定机位视角图像获取失败，使用模拟图像")
         
-        # 构建batch
+        # 预处理eye-in-hand视角图像
+        if "eih" in images:
+            eih_img_tensor = self.preprocess_image(images["eih"], debug=self.debug_image)
+        else:
+            # 随机图像回退
+            fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            eih_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
+            print("警告: eye-in-hand视角图像获取失败，使用模拟图像")
+        
+        # 构建batch - 使用新版本的格式
         batch = {
-            "observation.image.color": img_tensor.unsqueeze(0).to(self.device),
+            "observation.image.color": color_img_tensor.unsqueeze(0).to(self.device),
+            "observation.image.eih": eih_img_tensor.unsqueeze(0).to(self.device),
             "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
         }
         
@@ -335,6 +342,21 @@ class ACTPolicyWrapper:
         gripper_encoder = np.clip(gripper_encoder, 0, 255)
         
         return gripper_encoder
+    
+    def check_camera_status(self):
+        """检查相机状态"""
+        if not self.camera_system:
+            print("相机系统未初始化")
+            return False
+        
+        print("相机状态检查:")
+        for cam_name in self.camera_names:
+            if cam_name in self.camera_system.cameras:
+                print(f"  ✅ {cam_name}: 已初始化")
+            else:
+                print(f"  ❌ {cam_name}: 未初始化")
+        
+        return len(self.camera_system.cameras) > 0
 
 
 class ACTInferenceRunner:
@@ -346,7 +368,8 @@ class ACTInferenceRunner:
                  device: str = "cuda",
                  max_steps: int = 1000,
                  test_mode: bool = False,
-                 frequency: float = 20.0):
+                 frequency: float = 20.0,
+                 debug_image: bool = False):
         """
         初始化ACT推理运行器
         
@@ -364,6 +387,7 @@ class ACTInferenceRunner:
         self.max_steps = max_steps
         self.test_mode = test_mode
         self.frequency = frequency
+        self.debug_image = debug_image
         self.dt = 1.0 / frequency  # 时间间隔
         
         # 创建相机系统
@@ -373,7 +397,8 @@ class ACTInferenceRunner:
         self.policy = ACTPolicyWrapper(
             model_path=model_path,
             device=device,
-            camera_system=self.camera_system
+            camera_system=self.camera_system,
+            debug_image=self.debug_image
         )
         
         print(f"ACT推理运行器初始化完成")
@@ -382,6 +407,9 @@ class ACTInferenceRunner:
         print(f"设备: {device}")
         print(f"测试模式: {test_mode}")
         print(f"推理频率: {frequency} Hz")
+        
+        # 检查相机状态
+        self.policy.check_camera_status()
     
     def run(self):
         """执行推理"""
@@ -403,6 +431,7 @@ class ACTInferenceRunner:
                 'robot0_joint_vel': np.random.uniform(-0.1, 0.1, 7),
                 'robot0_eef_pos': np.random.uniform(0.3, 0.7, 3),
                 'robot0_eef_rot_axis_angle': np.random.uniform(-1, 1, 3),
+                'robot0_gripper_width': np.random.uniform(0.0, 0.08, 1),  # 添加gripper宽度
                 'timestamp': time.monotonic()
             }
             
@@ -539,9 +568,9 @@ class ACTInferenceRunner:
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="基于相机和ACT模型的实时推理脚本 - 重构版本")
+    parser = argparse.ArgumentParser(description="基于相机和ACT模型的实时推理脚本 - 更新版本")
     parser.add_argument("--model_path", type=str, 
-                       default="/home/robotflow/lerobot-main/src/temp/outputs/train/exo_act4/checkpoints/checkpoint_step_47500.safetensors",
+                       default="/home/robotflow/Downloads/050000/pretrained_model",
                        help="训练好的模型路径")
     parser.add_argument("--device", type=str, default="cuda",
                        help="计算设备 (cpu/cuda)")
@@ -552,8 +581,10 @@ def main():
                        help="最大运行步数")
     parser.add_argument("--test_mode", action="store_true", default=False,
                        help="测试模式（不连接真实机器人）")
-    parser.add_argument("--frequency", type=float, default=5.0,
+    parser.add_argument("--frequency", type=float, default=10.0,
                        help="推理频率 (Hz) - 针对130ms推理时间优化")
+    parser.add_argument("--debug_image", action="store_true", default=False,
+                       help="显示图像处理调试信息")
     
     args = parser.parse_args()
     
@@ -575,7 +606,8 @@ def main():
             device=args.device,
             max_steps=args.max_steps,
             test_mode=args.test_mode,
-            frequency=args.frequency
+            frequency=args.frequency,
+            debug_image=args.debug_image
         )
         
         # 执行推理

@@ -16,7 +16,7 @@ from multiprocessing.managers import SharedMemoryManager
 from real_world.franka_interpolation_controller import FrankaInterpolationController
 from real_world.wsg_controller import WSGController
 from shared_memory import SharedMemoryRingBuffer
-from common.gripper_util import convert_gripper_encoder_to_width, limit_gripper_step
+from common.gripper_util import convert_gripper_encoder_to_width, convert_gripper_width_to_encoder,limit_gripper_step
 
 
 class PolicyInterface:
@@ -151,7 +151,16 @@ class PolicyInterface:
             
         if target_time is None:
             policy_config = self.config['policy']
-            target_time = time.time() + policy_config['action_latency']
+            target_time = time.monotonic() + policy_config['action_latency']
+        # 目标时间保护：至少提前两个控制周期
+        try:
+            # 推理/上游循环周期（若可用）
+            dt = 1.0 / float(self.config.get('policy', {}).get('frequency', 5.0))
+        except Exception:
+            dt = 0.2
+        min_target = time.monotonic() + 2.0 * dt
+        if target_time < min_target:
+            target_time = min_target
             
         # 确保动作形状正确
         action = np.array(action)
@@ -176,7 +185,15 @@ class PolicyInterface:
             
         if target_time is None:
             policy_config = self.config['policy']
-            target_time = time.time() + policy_config['action_latency']
+            target_time = time.monotonic() + policy_config['action_latency']
+        # 目标时间保护：至少提前两个控制周期
+        try:
+            dt = 1.0 / float(self.config.get('policy', {}).get('frequency', 5.0))
+        except Exception:
+            dt = 0.2
+        min_target = time.monotonic() + 2.0 * dt
+        if target_time < min_target:
+            target_time = min_target
             
         # 将编码器值转换为gripper宽度
         gripper_width = convert_gripper_encoder_to_width(gripper_encoder)

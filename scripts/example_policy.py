@@ -38,10 +38,10 @@ class CirclePolicy:
     def __call__(self, obs):
         """策略函数"""
         if self.start_time is None:
-            self.start_time = time.time()
+            self.start_time = time.monotonic()
             
         # 计算时间
-        t = time.time() - self.start_time
+        t = time.monotonic() - self.start_time
         
         # 计算圆形轨迹
         angle = 2 * np.pi * self.frequency * t
@@ -76,14 +76,14 @@ class SinusoidalPolicy:
     def __call__(self, obs):
         """策略函数"""
         if self.start_time is None:
-            self.start_time = time.time()
+            self.start_time = time.monotonic()
             self.base_pose = np.concatenate([
                 obs['robot0_eef_pos'],
                 obs['robot0_eef_rot_axis_angle']
             ])
             
         # 计算时间
-        t = time.time() - self.start_time
+        t = time.monotonic() - self.start_time
         
         # 计算正弦波偏移
         offset = self.amplitude * np.sin(2 * np.pi * self.frequency * t)

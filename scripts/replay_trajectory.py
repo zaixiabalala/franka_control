@@ -54,7 +54,7 @@ class TrajectoryPolicy:
             action: 7维关节角度 [j1, j2, j3, j4, j5, j6, j7]
         """
         # 计算当前时间
-        current_time = time.time() - self.start_time
+        current_time = time.monotonic() - self.start_time
         
         # 根据时间计算数据索引
         data_index = int(current_time * self.data_frequency)
@@ -78,7 +78,7 @@ class TrajectoryPolicy:
     
     def get_gripper_action(self, obs):
         """获取gripper动作"""
-        current_time = time.time() - self.start_time
+        current_time = time.monotonic() - self.start_time
         data_index = int(current_time * self.data_frequency)
         
         if data_index >= len(self.gripper_data):
@@ -162,7 +162,7 @@ class CorrectTrajectoryReplayer:
         print(f"数据采集频率: {self.data_frequency}Hz")
         
         # 创建轨迹策略
-        start_time = time.time()
+        start_time = time.monotonic()
         policy = TrajectoryPolicy(
             trajectory_data=self.trajectory_data,
             gripper_data=self.gripper_data,
@@ -193,7 +193,7 @@ class CorrectTrajectoryReplayer:
             print(f"轨迹数据范围: 关节角度 [{trajectory_data.min():.3f}, {trajectory_data.max():.3f}]")
             
             # 创建真正的轨迹策略
-            start_time = time.time()
+            start_time = time.monotonic()
             policy = TrajectoryPolicy(
                 trajectory_data=trajectory_data,
                 gripper_data=self.gripper_data,
@@ -220,10 +220,10 @@ class CorrectTrajectoryReplayer:
             print("按 Ctrl+C 停止")
             
             step = 0
-            last_progress_time = time.time()
+            last_progress_time = time.monotonic()
             
             while True:
-                current_time = time.time() - start_time
+                current_time = time.monotonic() - start_time
                 
                 # 检查是否完成
                 if current_time >= total_data_time:

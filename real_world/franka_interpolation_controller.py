@@ -162,8 +162,8 @@ class FrankaInterpolationController(mp.Process):
             elif 'ee_pose' in func_name:
                 example[key] = np.zeros(6)
 
-        example['robot_receive_timestamp'] = time.time()
-        example['robot_timestamp'] = time.time()
+        example['robot_receive_timestamp'] = time.monotonic()
+        example['robot_timestamp'] = time.monotonic()
         ring_buffer = SharedMemoryRingBuffer.create_from_examples(
             shm_manager=shm_manager,
             examples=example,
@@ -332,7 +332,7 @@ class FrankaInterpolationController(mp.Process):
                     state[key] = getattr(self.robot, func_name)()
 
                     
-                t_recv = time.time()
+                t_recv = time.monotonic()
                 state['robot_receive_timestamp'] = t_recv
                 state['robot_timestamp'] = t_recv - self.receive_latency
                 self.ring_buffer.put(state)
@@ -384,9 +384,16 @@ class FrankaInterpolationController(mp.Process):
                         # 关节位置控制 - 调度目标关节位置
                         target_joints = command['target_pose']  # 现在表示关节角度
                         target_time = float(command['target_time'])
-                        # 将全局时间转换为单调时间
-                        target_time = time.monotonic() - time.time() + target_time
+                        # 目标时间已经是monotonic时间，直接使用
+                        original_time = target_time
+                        # target_time 已经是 monotonic 时间，无需转换
                         curr_time = t_now + dt
+                        
+                        # 调试信息
+                        if iter_idx % 50 == 0:  # 每50次循环打印一次
+                            print(f"[时间调试] 目标时间: {target_time:.3f}")
+                            print(f"[时间调试] 当前时间: {curr_time:.3f}")
+                            print(f"[时间调试] 时间差: {target_time - curr_time:.3f}")
                         joint_interp = joint_interp.schedule_waypoint(
                             joints=target_joints,
                             time=target_time,
