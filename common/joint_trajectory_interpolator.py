@@ -38,7 +38,7 @@ class JointTrajectoryInterpolator:
             
             # 使用线性插值
             self.joint_interp = si.interp1d(times, joints, 
-                axis=0, assume_sorted=True, kind='linear')
+                axis=0, assume_sorted=True, kind='cubic')
     
     @property
     def times(self) -> np.ndarray:

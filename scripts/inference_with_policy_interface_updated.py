@@ -5,6 +5,7 @@
 """
 
 import os
+from shlex import join
 import numpy as np
 import torch
 import time
@@ -16,6 +17,7 @@ import math
 from safetensors.torch import load_file
 import sys
 import yaml
+from common.gripper_util import convert_gripper_width_to_encoder
 
 
 # 添加项目路径到sys.path，确保优先使用项目中的lerobot库
@@ -25,9 +27,7 @@ sys.path.insert(0, str(model_lerobot_path))
 sys.path.insert(0, str(project_dir))  # 添加项目根目录到路径
 
 # 导入最新版本的lerobot库
-from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.constants import OBS_IMAGES, ACTION, OBS_STATE
 
 # 导入PolicyInterface
@@ -177,6 +177,9 @@ class ACTPolicyWrapper:
         # 移动到指定设备
         policy.to(self.device)
         
+        # 设置执行部署
+        policy.config.n_action_steps = 50
+
         # 打印配置信息
         print(f"模型加载成功:")
         print(f" 策略类型: {policy.config.type}")
@@ -184,14 +187,6 @@ class ACTPolicyWrapper:
         print(f" 时间集成系数: {policy.config.temporal_ensemble_coeff}")
         print(f" 动作步数: {policy.config.n_action_steps}")
         print(f" 块大小: {policy.config.chunk_size}")
-        
-        # 打印时间集成配置信息
-        if policy.config.temporal_ensemble_coeff is not None:
-            print("✅ 时间集成加权机制已启用")
-            print("✅ 每次select_action都会重新推理")
-        else:
-            print("❌ 时间集成加权机制未启用")
-            print("❌ 使用队列机制，可能导致回退问题")
         
         return policy
     
@@ -309,39 +304,14 @@ class ACTPolicyWrapper:
         # 单步预测动作
         full_action = self.predict_single_action(current_images, current_state)
         
-        # 返回关节动作（前7维）
         joint_action = full_action[:self.joint_dim]
-        
-        return joint_action
-    
-    def get_gripper_action(self, obs):
-        """
-        获取gripper动作
-        
-        Args:
-            obs: 观测字典
-            
-        Returns:
-            gripper_encoder: gripper编码器值 (0-255)
-        """
-        # 获取当前图像
-        current_images = self.camera_system.get_all_images()
-        
-        # 获取当前状态
-        current_state = self.get_current_state_with_gripper(obs)
-        
-        # 单步预测动作
-        full_action = self.predict_single_action(current_images, current_state)
-        
         # 获取gripper动作（第8维）
         gripper_width = full_action[self.joint_dim] - 0.005 # 夹爪宽度（米）
-        
-        # 将gripper宽度转换为编码器值
-        # gripper宽度范围是0-0.08米，编码器范围是0-255
-        gripper_encoder = int(gripper_width * 255 / 0.08)
-        gripper_encoder = np.clip(gripper_encoder, 0, 255)
-        
-        return gripper_encoder
+
+        gripper_encoder = convert_gripper_width_to_encoder(gripper_width)
+
+        cur_action = np.concatenate([joint_action, [gripper_encoder]])
+        return cur_action
     
     def check_camera_status(self):
         """检查相机状态"""
@@ -436,10 +406,13 @@ class ACTInferenceRunner:
             }
             
             # 执行策略
-            joint_action = self.policy(obs)
-            gripper_action = self.policy.get_gripper_action(obs)
+            cur_action = self.policy(obs)
+            joint_action = cur_action[:self.policy.joint_dim]
+            gripper_action = cur_action[self.policy.joint_dim]
             
             print(f"预测的关节动作（7维）: {joint_action}")
+            print(f"预测的夹爪动作（1维）: {gripper_action}")
+            print(f"预测的完整动作（8维）: {cur_action}")
             print(f"预测的夹爪动作: {gripper_action}")
             
             time.sleep(2)
@@ -490,15 +463,16 @@ class ACTInferenceRunner:
                 # 执行策略 - 添加超时检查
                 t_inference_start = time.monotonic()
                 try:
-                    joint_action = self.policy(obs)
-                    gripper_action = self.policy.get_gripper_action(obs)
+                    cur_action = self.policy(obs)
+                    joint_action = cur_action[:self.policy.joint_dim]
+                    gripper_action = cur_action[self.policy.joint_dim]
                     t_inference_end = time.monotonic()
                     inference_time = t_inference_end - t_inference_start
                     inference_times.append(inference_time)
                     
                     # 更新最后有效的动作
-                    last_joint_action = joint_action.copy()
-                    last_gripper_action = gripper_action
+                    last_joint_action = cur_action.copy()
+                    last_gripper_action = cur_action[self.policy.joint_dim]
                     timeout_count = 0
                     
                 except Exception as e:
@@ -515,8 +489,7 @@ class ACTInferenceRunner:
                 
                 # 如果推理时间过长或剩余时间不足，使用降级策略
                 if (inference_time > max_inference_time or 
-                    remaining_time < 0.01 or  # 剩余时间少于10ms
-                    timeout_count > 0):
+                    remaining_time < 0.01): # 剩余时间少于10ms):
                     
                     if last_joint_action is not None and last_gripper_action is not None:
                         # 使用上次的有效动作
@@ -524,10 +497,10 @@ class ACTInferenceRunner:
                         gripper_action = last_gripper_action
                         print(f"⚠️  使用降级策略: 推理时间={inference_time:.3f}s, 剩余时间={remaining_time:.3f}s")
                     else:
-                        # 如果没有任何有效动作，使用当前位置
-                        joint_action = obs['robot0_joint_pos']
-                        gripper_action = 128  # 默认gripper位置
-                        print(f"⚠️  使用当前位置: 推理时间={inference_time:.3f}s")
+                        # 不要使用当前位置，而是跳过这次执行
+                        joint_action = obs['robot0_joint_pos'] + np.random.normal(0, 0.001, 7)
+                        print(f"⚠️  使用随机扰动动作，等待有效推理: 推理时间={inference_time:.3f}s")
+                        continue  # 跳过这次循环
                 
                 # 执行动作
                 interface.execute_action(joint_action)
