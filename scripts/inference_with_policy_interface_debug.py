@@ -552,8 +552,7 @@ class ACTInferenceRunner:
                 
                 # 如果推理时间过长或剩余时间不足，使用降级策略
                 if (inference_time > max_inference_time or 
-                    remaining_time < 0.01 or  # 剩余时间少于10ms
-                    timeout_count > 0):
+                    remaining_time < 0.01):
                     
                     if last_joint_action is not None and last_gripper_action is not None:
                         # 使用上次的有效动作
@@ -561,10 +560,9 @@ class ACTInferenceRunner:
                         gripper_action = last_gripper_action
                         print(f"⚠️  使用降级策略: 推理时间={inference_time:.3f}s, 剩余时间={remaining_time:.3f}s")
                     else:
-                        # 如果没有任何有效动作，使用当前位置
-                        joint_action = obs['robot0_joint_pos']
-                        gripper_action = 128  # 默认gripper位置
-                        print(f"⚠️  使用当前位置: 推理时间={inference_time:.3f}s")
+                        # 不要使用当前位置，而是跳过这次执行
+                        print(f"⚠️  跳过执行，等待有效推理: 推理时间={inference_time:.3f}s")
+                        continue  # 跳过这次循环
                 
                 # 记录调试数据
                 input_data = {
