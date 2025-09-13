@@ -486,8 +486,7 @@ class ACTInferenceRunner:
                 
                 # 如果推理时间过长或剩余时间不足，使用降级策略
                 if (inference_time > max_inference_time or 
-                    remaining_time < 0.01 or  # 剩余时间少于10ms
-                    timeout_count > 0):
+                    remaining_time < 0.01):
                     
                     if last_joint_action is not None and last_gripper_action is not None:
                         # 使用上次的有效动作
@@ -552,7 +551,7 @@ def main():
                        help="最大运行步数")
     parser.add_argument("--test_mode", action="store_true", default=False,
                        help="测试模式（不连接真实机器人）")
-    parser.add_argument("--frequency", type=float, default=5.0,
+    parser.add_argument("--frequency", type=float, default=10.0,
                        help="推理频率 (Hz) - 针对130ms推理时间优化")
     
     args = parser.parse_args()

@@ -47,6 +47,6 @@ policy:
   obs_dim: 14 # 关节位置7 + 关节速度7
 
   # 控制延迟补偿
-  action_latency: 0.2 # 动作延迟 (秒)
+  action_latency: 0.15 # 动作延迟 (秒)
   obs_latency: 0.0001 # 观测延迟 (秒)
-  frequency: 5.0 # 策略频率 (Hz)
+  frequency: 10.0 # 策略频率 (Hz)

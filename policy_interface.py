@@ -155,9 +155,9 @@ class PolicyInterface:
         # 目标时间保护：至少提前两个控制周期
         try:
             # 推理/上游循环周期（若可用）
-            dt = 1.0 / float(self.config.get('policy', {}).get('frequency', 5.0))
+            dt = 1.0 / float(self.config.get('policy', {}).get('frequency', 10.0))
         except Exception:
-            dt = 0.2
+            dt = 0.1
         min_target = time.monotonic() + 2.0 * dt
         if target_time < min_target:
             target_time = min_target
