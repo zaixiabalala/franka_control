@@ -24,3 +24,4 @@ __all__ = [
     "AnomalyDetector",
     "VideoReplayGenerator"
 ]
+

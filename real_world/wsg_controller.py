@@ -264,8 +264,6 @@ class WSGController(mp.Process):
                     elif cmd == Command.SCHEDULE_WAYPOINT.value:
                         target_pos = command['target_pos'] * self.scale
                         target_time = command['target_time']
-                        # 将全局时间转换为单调时间
-                        target_time = time.monotonic() - time.time() + target_time
                         curr_time = t_now
                         pose_interp = pose_interp.schedule_waypoint(
                             pose=[target_pos, 0, 0, 0, 0, 0],

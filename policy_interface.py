@@ -196,8 +196,7 @@ class PolicyInterface:
             target_time = min_target
             
         # 将编码器值转换为gripper宽度
-        gripper_width = convert_gripper_encoder_to_width(gripper_encoder)
-        
+        gripper_width = gripper_encoder
         # 发送gripper命令
         self.gripper_controller.schedule_waypoint(gripper_width, target_time)
         

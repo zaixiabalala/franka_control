@@ -36,7 +36,7 @@ class JointTrajectoryInterpolator:
             self.single_step = False
             assert np.all(times[1:] >= times[:-1])
             
-            # 使用线性插值
+            # 使用三次样条插值
             self.joint_interp = si.interp1d(times, joints, 
                 axis=0, assume_sorted=True, kind='cubic')
     

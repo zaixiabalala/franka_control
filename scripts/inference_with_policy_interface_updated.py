@@ -271,8 +271,8 @@ class ACTPolicyWrapper:
         
         # 构建batch - 使用新版本的格式
         batch = {
-            "observation.image.color": color_img_tensor.unsqueeze(0).to(self.device),
-            "observation.image.eih": eih_img_tensor.unsqueeze(0).to(self.device),
+            "observation.images.cam": color_img_tensor.unsqueeze(0).to(self.device),
+            "observation.images.eih": eih_img_tensor.unsqueeze(0).to(self.device),
             "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
         }
         
@@ -308,9 +308,7 @@ class ACTPolicyWrapper:
         # 获取gripper动作（第8维）
         gripper_width = full_action[self.joint_dim] - 0.005 # 夹爪宽度（米）
 
-        gripper_encoder = convert_gripper_width_to_encoder(gripper_width)
-
-        cur_action = np.concatenate([joint_action, [gripper_encoder]])
+        cur_action = np.concatenate([joint_action, [gripper_width]])
         return cur_action
     
     def check_camera_status(self):
@@ -471,8 +469,8 @@ class ACTInferenceRunner:
                     inference_times.append(inference_time)
                     
                     # 更新最后有效的动作
-                    last_joint_action = cur_action.copy()
-                    last_gripper_action = cur_action[self.policy.joint_dim]
+                    last_joint_action = joint_action.copy()
+                    last_gripper_action = gripper_action.copy()
                     timeout_count = 0
                     
                 except Exception as e:
