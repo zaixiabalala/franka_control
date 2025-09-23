@@ -1,20 +1,45 @@
-# 核心依赖
+#############################
+# 基础功能 (core)
+#############################
 numpy>=1.21.0
 scipy>=1.7.0
 torch>=1.9.0
-
-# 机器人控制
-polymetis>=0.1.0
-zerorpc>=0.6.0
-
-# 原子操作
-atomics>=0.1.0
-
-# 配置和工具
 PyYAML>=6.0
 click>=8.0.0
+atomics>=0.1.0
 
-# 可选依赖（用于高级功能）
-# opencv-python>=4.5.0  # 如果需要图像处理
-# matplotlib>=3.5.0     # 如果需要可视化
-# tqdm>=4.60.0          # 如果需要进度条
+# RPC/通讯
+zerorpc>=0.6.0
+pyzmq>=25.0.0
+gevent>=22.10.2
+msgpack>=1.0.5
+
+# 输入设备与实用
+pynput>=1.7.6
+Pillow>=9.5.0
+safetensors>=0.3.1
+
+
+#############################
+# r3kit 功能 (RealSense 等)
+#############################
+#访问https://github.com/ForceMimic/r3kit 自行安装
+
+
+#############################
+# lerobot 功能
+#############################
+#访问 https://github.com/huggingface/lerobot 自行安装
+
+
+#############################
+# RISE 功能
+#############################
+#访问 https://github.com/rise-policy/rise 自行安装
+
+
+#############################
+# SpaceMouse / spnav (Linux/WSL)
+#############################
+# 若使用真实 SpaceMouse：需安装系统包 spacenavd 与 Python 绑定
+# python3-spnav 或 pip 包（不同平台名称可能不同）。Windows 原生通常不可用。

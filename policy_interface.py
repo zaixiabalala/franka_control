@@ -1,11 +1,6 @@
 """
 策略接口模块
 提供统一的策略控制接口，支持不同的策略实现
-
-基于UMI (Universal Manipulation Interface) 项目重构：
-- 从笛卡尔位姿控制改为关节空间控制
-- 添加了gripper控制支持
-- 优化了策略接口设计
 """
 
 import time
@@ -114,10 +109,10 @@ class PolicyInterface:
         
         # 构建观测字典 - 主要使用关节信息
         obs = {
-            'robot0_eef_pos': state['ActualTCPPose'][:3],  # 保留用于兼容性
-            'robot0_eef_rot_axis_angle': state['ActualTCPPose'][3:],  # 保留用于兼容性
-            'robot0_joint_pos': state['ActualQ'],  # 主要使用
-            'robot0_joint_vel': state['ActualQd'],  # 主要使用
+            'robot0_eef_pos': state['ActualTCPPose'][:3], 
+            'robot0_eef_rot_axis_angle': state['ActualTCPPose'][3:],  
+            'robot0_joint_pos': state['ActualQ'], 
+            'robot0_joint_vel': state['ActualQd'],
             'timestamp': state['robot_timestamp']
         }
         
@@ -162,7 +157,6 @@ class PolicyInterface:
         if target_time < min_target:
             target_time = min_target
             
-        # 确保动作形状正确
         action = np.array(action)
         if action.shape != (7,):
             raise ValueError(f"动作形状应为(7,)，实际为{action.shape}")
@@ -181,7 +175,7 @@ class PolicyInterface:
             raise RuntimeError("策略接口未启动")
             
         if self.gripper_controller is None:
-            return  # 如果没有gripper控制器，直接返回
+            return  
             
         if target_time is None:
             policy_config = self.config['policy']
@@ -195,9 +189,7 @@ class PolicyInterface:
         if target_time < min_target:
             target_time = min_target
             
-        # 将编码器值转换为gripper宽度
         gripper_width = gripper_encoder
-        # 发送gripper命令
         self.gripper_controller.schedule_waypoint(gripper_width, target_time)
         
     def run_policy(self, 
@@ -222,27 +214,21 @@ class PolicyInterface:
                 if max_steps is not None and step >= max_steps:
                     break
                     
-                # 获取观测
                 obs = self.get_observation()
                 
-                # 执行策略
                 action = self.policy_fn(obs)
                 
-                # 执行动作
                 self.execute_action(action)
                 
-                # 执行gripper动作（如果策略支持）
                 if hasattr(self.policy_fn, 'get_gripper_action'):
                     gripper_action = self.policy_fn.get_gripper_action(obs)
                     self.execute_gripper_action(gripper_action)
                 
-                # 调用回调函数
                 if step_callback:
                     step_callback(step, obs, action)
                     
                 step += 1
                 
-                # 短暂等待
                 time.sleep(0.01)
                 
         except KeyboardInterrupt:

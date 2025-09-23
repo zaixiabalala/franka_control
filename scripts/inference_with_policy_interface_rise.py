@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-基于相机和ACT模型的实时推理脚本 - 调试版本
-适配最新版本的lerobot库，集成推理数据保存功能
+基于RISE模型的实时推理脚本 - Franka机器人部署
+
+快速启动:
+  python inference_with_policy_interface_rise.py
+
+默认参数:
+  - 测试模式: True (不连接真实机器人)
+  - 推理频率: 5.0 Hz
+  - 计算设备: cuda
+  - 最大步数: 1000
+  - 模型路径: 自动搜索 RISE/logs/my_task/policy_last.ckpt
+  - 配置文件: 自动搜索 franka_control/config/robot_config.yaml
+
+功能:
+  - 支持RealSense D415深度相机
+  - 基于点云的RISE策略推理
+  - 实时机器人控制（可选）
+  - 智能路径搜索和错误处理
 """
 
 import os
@@ -19,9 +35,6 @@ import sys
 import yaml
 from common.gripper_util import convert_gripper_width_to_encoder
 
-# 导入debug_logger
-from debug_logger import InferenceLogger, AnomalyDetector
-
 
 # 添加项目路径到sys.path，确保优先使用项目中的lerobot库
 project_dir = Path(__file__).parent.parent
@@ -29,9 +42,22 @@ model_lerobot_path = project_dir / "model" / "lerobot" / "src"
 sys.path.insert(0, str(model_lerobot_path))
 sys.path.insert(0, str(project_dir))  # 添加项目根目录到路径
 
-# 导入最新版本的lerobot库
-from lerobot.policies.act.modeling_act import ACTPolicy
-from lerobot.constants import OBS_IMAGES, ACTION, OBS_STATE
+# 导入 RISE 策略（基于 my_train.py 和 eval.py）
+import sys
+rise_path = Path(__file__).parent.parent.parent / "RISE"
+sys.path.insert(0, str(rise_path))
+
+# 导入必要的库
+try:
+    import open3d as o3d
+    import MinkowskiEngine as ME
+    from policy import RISE
+    from dataset.projector import Projector
+    RISE_AVAILABLE = True
+except ImportError as e:
+    print(f"警告: RISE相关库导入失败: {e}")
+    print("请确保已安装 open3d, MinkowskiEngine 等依赖")
+    RISE_AVAILABLE = False
 
 # 导入PolicyInterface
 from policy_interface import create_policy_interface
@@ -110,6 +136,33 @@ class CameraSystem:
             print(f"获取 {cam_name} 图像失败: {e}")
             return None
     
+    def get_image_and_depth(self, cam_name):
+        """获取指定相机的RGB和深度图像"""
+        if cam_name not in self.cameras:
+            return None, None
+        
+        try:
+            if self.use_realsense:
+                # r3kit D415 接口
+                color, depth = self.cameras[cam_name].get()
+                if color is None or depth is None:
+                    return None, None
+                # 转 RGB
+                frame_rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+                return frame_rgb, depth
+            else:
+                # OpenCV 摄像头 - 生成模拟深度图
+                ret, frame = self.cameras[cam_name].read()
+                if ret:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # 生成模拟深度图（实际使用时需要真实深度相机）
+                    fake_depth = np.ones((frame_rgb.shape[0], frame_rgb.shape[1]), dtype=np.float32) * 0.5
+                    return frame_rgb, fake_depth
+                return None, None
+        except Exception as e:
+            print(f"获取 {cam_name} 图像和深度失败: {e}")
+            return None, None
+    
     def get_all_images(self):
         """获取所有相机的图像"""
         images = {}
@@ -129,12 +182,10 @@ class CameraSystem:
         for cam_name, cap in self.cameras.items():
             try:
                 if self.use_realsense:
-                    # D415 类可能没有 stop 方法，使用 __del__ 或者不做任何操作
                     if hasattr(cap, 'stop'):
                         cap.stop()
                     elif hasattr(cap, 'close'):
                         cap.close()
-                    # 对于 r3kit D415，通常由析构函数自动处理
                 else:
                     cap.release()
                 print(f"{cam_name} 已关闭")
@@ -142,103 +193,156 @@ class CameraSystem:
                 print(f"关闭 {cam_name} 失败: {e}")
 
 
-class ACTPolicyWrapper:
-    """ACT策略包装器 - 适配最新版本的lerobot库"""
+class RISEPolicyWrapper:
+    """RISE策略包装器 - 基于点云和MinkowskiEngine的策略"""
     
     def __init__(self, model_path, device="cpu", camera_system=None, debug_image=False):
+        if not RISE_AVAILABLE:
+            raise ImportError("RISE相关库未正确安装，请检查依赖")
+            
         self.device = torch.device(device)
         self.model_path = Path(model_path)
         self.camera_system = camera_system
         self.debug_image = debug_image
         
-        # 配置参数
-        self.image_size = (224, 224)
+        # 配置参数 - 基于 RISE 模型
         self.camera_names = ["cam4", "eih"]  # 支持双视角
         self.joint_dim = 7  # 7个关节角度（弧度）  
         self.gripper_dim = 1  # 1个夹爪开合值  
         self.action_dim = self.joint_dim + self.gripper_dim  # 总共8维  
-        self.chunk_size = 32  # ACT模型的chunk大小
+        
+        # RISE 模型参数
+        self.num_action = 20  # 动作序列长度
+        self.voxel_size = 0.005  # 体素大小
+        self.obs_feature_dim = 512  # 观测特征维度
+        self.hidden_dim = 512  # 隐藏层维度
+        self.nheads = 8  # 注意力头数
+        self.num_encoder_layers = 4  # 编码器层数
+        self.num_decoder_layers = 1  # 解码器层数
+        self.dropout = 0.1  # dropout率
+        self.action_queue = []
         
         # 加载模型
         self.policy = self._load_policy()
         
-        print(f"ACT策略初始化完成: {model_path}")
+        print(f"RISE策略初始化完成: {model_path}")
         print(f"使用设备: {self.device}")
         print(f"支持双视角输入: 固定机位(cam4) + eye-in-hand(eih)")
         print(f"相机系统状态: {len(self.camera_system.cameras) if self.camera_system else 0} 个相机已初始化")
     
     def _load_policy(self):
-        """加载训练好的策略模型"""
+        """加载训练好的RISE策略模型"""
         if not self.model_path.exists():
             raise FileNotFoundError(f"模型路径不存在: {self.model_path}")
         
-        # 使用from_pretrained加载模型(推荐方式)
-        policy = ACTPolicy.from_pretrained(
-            pretrained_name_or_path=str(self.model_path)
-        )
+        policy = RISE(
+            num_action=self.num_action,
+            input_dim=6,  # 点云特征维度：3D坐标 + 3D颜色
+            obs_feature_dim=self.obs_feature_dim,
+            action_dim=8,  # 7个关节 + 1个夹爪
+            hidden_dim=self.hidden_dim,
+            nheads=self.nheads,
+            num_encoder_layers=self.num_encoder_layers,
+            num_decoder_layers=self.num_decoder_layers,
+            dropout=self.dropout
+        ).to(self.device)
         
-        # 移动到指定设备
-        policy.to(self.device)
+        checkpoint = torch.load(self.model_path, map_location=self.device)
+        policy.load_state_dict(checkpoint, strict=False)
         
-        # 设置执行部署
-        policy.config.n_action_steps = 50
-
-        # 打印配置信息
-        print(f"模型加载成功:")
-        print(f" 策略类型: {policy.config.type}")
+        print(f"RISE模型加载成功:")
+        print(f" 模型类型: RISE (基于点云的策略)")
         print(f" 设备: {next(policy.parameters()).device}")
-        print(f" 时间集成系数: {policy.config.temporal_ensemble_coeff}")
-        print(f" 动作步数: {policy.config.n_action_steps}")
-        print(f" 块大小: {policy.config.chunk_size}")
+        print(f" 动作序列长度: {self.num_action}")
+        print(f" 体素大小: {self.voxel_size}")
+        print(f" 观测特征维度: {self.obs_feature_dim}")
+        print(f" 隐藏层维度: {self.hidden_dim}")
+        print(f" 注意力头数: {self.nheads}")
+        print(f" 编码器层数: {self.num_encoder_layers}")
+        print(f" 解码器层数: {self.num_decoder_layers}")
         
         return policy
     
-    def preprocess_image(self, image, debug=False):
-        """预处理图像 - 与训练时保持一致：先裁剪成正方形，再缩放到目标尺寸"""
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
+    def create_point_cloud(self, color_image, depth_image, cam_intrinsics):
+        """
+        从RGB-D图像创建点云（基于 eval.py）
+        """
+        h, w = depth_image.shape
+        fx, fy = cam_intrinsics[0, 0], cam_intrinsics[1, 1]
+        cx, cy = cam_intrinsics[0, 2], cam_intrinsics[1, 2]
+
+        colors = o3d.geometry.Image(color_image.astype(np.uint8))
+        depths = o3d.geometry.Image(depth_image.astype(np.float32))
+
+        camera_intrinsics = o3d.camera.PinholeCameraIntrinsic(
+            width=w, height=h, fx=fx, fy=fy, cx=cx, cy=cy
+        )
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            colors, depths, depth_scale=1.0, convert_rgb_to_intensity=False
+        )
+        cloud = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, camera_intrinsics)
+        cloud = cloud.voxel_down_sample(self.voxel_size)
+        points = np.array(cloud.points).astype(np.float32)
+        colors = np.array(cloud.colors).astype(np.float32)
+
+        # 工作空间裁剪
+        x_mask = ((points[:, 0] >= WORKSPACE_MIN[0]) & (points[:, 0] <= WORKSPACE_MAX[0]))
+        y_mask = ((points[:, 1] >= WORKSPACE_MIN[1]) & (points[:, 1] <= WORKSPACE_MAX[1]))
+        z_mask = ((points[:, 2] >= WORKSPACE_MIN[2]) & (points[:, 2] <= WORKSPACE_MAX[2]))
+        mask = (x_mask & y_mask & z_mask)
+        points = points[mask]
+        colors = colors[mask]
         
-        # 获取原始图像尺寸
-        width, height = image.size
-        if debug:
-            print(f"原始图像尺寸: {width}x{height}")
+        # ImageNet归一化
+        colors = (colors - IMG_MEAN) / IMG_STD
         
-        # 先裁剪成正方形（取较小的边作为边长）
-        if width > height:
-            # 宽度大于高度，从中心裁剪
-            left = (width - height) // 2
-            right = left + height
-            top = 0
-            bottom = height
-        else:
-            # 高度大于等于宽度，从中心裁剪
-            top = (height - width) // 2
-            bottom = top + width
-            left = 0
-            right = width
+        # 合并点和颜色
+        cloud_final = np.concatenate([points, colors], axis=-1).astype(np.float32)
+        return cloud_final
+    
+    def create_batch(self, coords, feats):
+        coords_batch = [coords]
+        feats_batch = [feats]
+        coords_batch, feats_batch = ME.utils.sparse_collate(coords_batch, feats_batch)
+        return coords_batch, feats_batch
+    
+    def create_input(self, color_image, depth_image, cam_intrinsics):
+        """
+        从RGB-D图像创建输入（基于 eval.py）
+        """
+        cloud = self.create_point_cloud(color_image, depth_image, cam_intrinsics)
+        coords = np.ascontiguousarray(cloud[:, :3] / self.voxel_size, dtype=np.int32)
+        coords_batch, feats_batch = self.create_batch(coords, cloud)
+        return coords_batch, feats_batch, cloud
+    
+    def unnormalize_action(self, action):
+        """
+        反归一化动作（基于 myworld.py 的训练时归一化方式）
         
-        # 裁剪成正方形
-        image_cropped = image.crop((left, top, right, bottom))
-        if debug:
-            print(f"裁剪后尺寸: {image_cropped.size}")
+        Args:
+            action: 归一化的动作 (..., 8) - 前7维关节角度，第8维夹爪宽度
         
-        # 缩放到目标尺寸
-        image_resized = image_cropped.resize(self.image_size, Image.Resampling.LANCZOS)
-        if debug:
-            print(f"缩放后尺寸: {image_resized.size}")
+        Returns:
+            action: 反归一化后的动作
+                - 前7维：关节角度（弧度），范围 [-π, π]
+                - 第8维：夹爪宽度（米），范围 [0, 0.08]
+        """
+        action = action.copy()
         
-        # 转换为tensor并归一化
-        image_tensor = torch.from_numpy(np.array(image_resized)).permute(2, 0, 1).float()  # (3, H, W)
-        image_tensor = image_tensor / 255.0
+        # 反归一化关节角度：从 [-1, 1] 恢复到 [-π, π]
+        action[..., :7] = action[..., :7] * np.pi
         
-        return image_tensor
+        # 反归一化夹爪宽度：从 [-1, 1] 恢复到 [0, 0.08]
+        # 训练时：gripper_norm = (gripper - 0.0) / 0.08 * 2 - 1
+        # 反推：gripper = (gripper_norm + 1) * 0.08 / 2
+        action[..., 7] = (action[..., 7] + 1) * 0.08 / 2
+        
+        return action
     
     def get_current_state_with_gripper(self, obs):
         """从观测中获取当前状态（8维）"""
-        # 从观测中提取关节位置（弧度）
         joints_rad = obs['robot0_joint_pos']  # (7,)
         
-        # 获取夹爪宽度（从观测中获取，如果没有则使用默认值）
         if 'robot0_gripper_width' in obs:
             gripper_width = obs['robot0_gripper_width']
             if isinstance(gripper_width, np.ndarray):
@@ -249,42 +353,77 @@ class ACTPolicyWrapper:
         # 返回8维状态：7个关节角度（弧度） + 1个夹爪宽度（米）
         return np.concatenate([joints_rad, [gripper_width]])
     
-    def predict_single_action(self, images, current_state):
+    def preprocess_image(self, image, depth):
         """
-        单步预测动作（使用 ACTPolicy.select_action）。
+        根据RGB图像对齐裁剪深度图
+        
+        Args:
+            image: RGB图像 (480, 640, 3) uint8
+            depth: 深度图 (480, 640) uint16 毫米单位
+        
+        Returns:
+            cropped_rgb: 裁剪后的RGB图像
+            cropped_depth: 裁剪后的深度图
+        """
+        # 确保输入是numpy数组
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        if isinstance(depth, Image.Image):
+            depth = np.array(depth)
+        
+        # 获取原始图像尺寸
+        h, w = image.shape[:2]
+        start_w = 200
+        end_w = 560
+        start_h = 0
+        end_h = 360
+
+        # 裁剪深度图和RGB图
+        cropped_depth = depth[start_h:end_h, start_w:end_w]
+        cropped_rgb = image[start_h:end_h, start_w:end_w]
+        
+        return cropped_rgb, cropped_depth
+
+    
+    def predict_single_action(self, images, current_state, cam_intrinsics):
+        """
+        单步预测动作（使用 RISE 策略）。
         返回: (8,) numpy 数组，前7维为关节(弧度)，第8维为夹爪(米)。
         """
-        # 预处理固定机位视角图像
+        # 获取RGB和深度图像
         if "cam4" in images:
-            color_img_tensor = self.preprocess_image(images["cam4"], debug=self.debug_image)
+            color_img, depth_img = self.camera_system.get_image_and_depth("cam4")
         else:
-            # 随机图像回退
-            fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            color_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
-            print("警告: 固定机位视角图像获取失败，使用模拟图像")
+            # 生成模拟数据
+            color_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            depth_img = np.ones((480, 640), dtype=np.float32) * 0.5
+            print("警告: 固定机位视角图像获取失败，使用模拟数据")
         
-        # 预处理eye-in-hand视角图像
-        if "eih" in images:
-            eih_img_tensor = self.preprocess_image(images["eih"], debug=self.debug_image)
-        else:
-            # 随机图像回退
-            fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            eih_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
-            print("警告: eye-in-hand视角图像获取失败，使用模拟图像")
+        if color_img is None or depth_img is None:
+            color_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            depth_img = np.ones((480, 640), dtype=np.float32) * 0.5
+            print("警告: 图像获取失败，使用模拟数据")
         
-        # 构建batch - 使用新版本的格式
-        batch = {
-            "observation.image.color": color_img_tensor.unsqueeze(0).to(self.device),
-            "observation.image.eih": eih_img_tensor.unsqueeze(0).to(self.device),
-            "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
-        }
+        color_img, depth_img = self.preprocess_image(color_img, depth_img)
         
-        with torch.no_grad():
-            # 使用select_action进行单步预测
-            action = self.policy.select_action(batch)  # (1, action_dim)，已反归一化
-            action = action.squeeze(0).detach().cpu().numpy()  # (8,)
-        
-        # 直接返回模型输出，所有单位都是弧度（前7维）和米（第8维）
+        # 创建点云输入
+        coords_batch, feats_batch, cloud = self.create_input(color_img, depth_img, cam_intrinsics)
+        feats_batch, coords_batch = feats_batch.to(self.device), coords_batch.to(self.device)
+        cloud_data = ME.SparseTensor(feats_batch, coords_batch)
+
+        if len(self.action_queue) == 0:
+            with torch.no_grad():
+                # 使用RISE策略进行预测
+                pred_raw_actions = self.policy(cloud_data, actions=None, batch_size=1).squeeze(0).cpu().numpy()
+                
+                # 反归一化动作
+                actions = self.unnormalize_action(pred_raw_actions)
+                
+                for action in actions:
+                    self.action_queue.append(action)
+
+        action = self.action_queue.pop(0)
+            
         return action
     
     
@@ -296,7 +435,7 @@ class ACTPolicyWrapper:
             obs: 观测字典，包含robot0_joint_pos等
             
         Returns:
-            action: 7维关节动作 [j1, j2, j3, j4, j5, j6, j7] (弧度)
+            action: 8维动作 [j1, j2, j3, j4, j5, j6, j7, gripper] (弧度, 米)
         """
         # 获取当前图像
         current_images = self.camera_system.get_all_images()
@@ -304,16 +443,18 @@ class ACTPolicyWrapper:
         # 获取当前状态
         current_state = self.get_current_state_with_gripper(obs)
         
+        # 相机内参
+        cam_intrinsics = np.array([[606.268127441406, 0, 319.728454589844, 0],
+                              [0, 605.743286132812, 234.524749755859, 0],
+                              [0, 0, 1, 0]])
+        
         # 单步预测动作
-        full_action = self.predict_single_action(current_images, current_state)
+        full_action = self.predict_single_action(current_images, current_state, cam_intrinsics)
         
         joint_action = full_action[:self.joint_dim]
-        # 获取gripper动作（第8维）
-        gripper_width = full_action[self.joint_dim] - 0.005 # 夹爪宽度（米）
+        gripper_width = full_action[self.joint_dim]  # 夹爪宽度（米）
 
-        gripper_encoder = convert_gripper_width_to_encoder(gripper_width)
-
-        cur_action = np.concatenate([joint_action, [gripper_encoder]])
+        cur_action = np.concatenate([joint_action, [gripper_width]])
         return cur_action
     
     def check_camera_status(self):
@@ -332,8 +473,8 @@ class ACTPolicyWrapper:
         return len(self.camera_system.cameras) > 0
 
 
-class ACTInferenceRunner:
-    """ACT推理运行器 - 使用与replay_trajectory相同的接口形式"""
+class RISEInferenceRunner:
+    """RISE推理运行器 """
     
     def __init__(self, 
                  model_path: str,
@@ -342,9 +483,7 @@ class ACTInferenceRunner:
                  max_steps: int = 1000,
                  test_mode: bool = False,
                  frequency: float = 20.0,
-                 debug_image: bool = False,
-                 debug_log_dir: str = "debug_logs",
-                 save_frequency: int = 1):
+                 debug_image: bool = False):
         """
         初始化ACT推理运行器
         
@@ -355,9 +494,6 @@ class ACTInferenceRunner:
             max_steps: 最大运行步数
             test_mode: 测试模式
             frequency: 推理频率 (Hz)
-            debug_image: 是否显示图像处理调试信息
-            debug_log_dir: 调试日志保存目录
-            save_frequency: 数据保存频率（每N步保存一次）
         """
         self.model_path = model_path
         self.config_path = config_path
@@ -371,37 +507,20 @@ class ACTInferenceRunner:
         # 创建相机系统
         self.camera_system = CameraSystem()
         
-        # 创建ACT策略
-        self.policy = ACTPolicyWrapper(
+        # 创建RISE策略
+        self.policy = RISEPolicyWrapper(
             model_path=model_path,
             device=device,
             camera_system=self.camera_system,
             debug_image=self.debug_image
         )
         
-        # 初始化调试记录器
-        self.logger = InferenceLogger(
-            log_dir=debug_log_dir,
-            save_frequency=save_frequency,
-            save_images=True,
-            max_logs=10000
-        )
-        
-        # 初始化异常检测器
-        self.detector = AnomalyDetector(
-            action_threshold=0.5,
-            inference_time_threshold=0.1,
-            gripper_threshold=10
-        )
-        
-        print(f"ACT推理运行器初始化完成")
+        print(f"RISE推理运行器初始化完成")
         print(f"模型路径: {model_path}")
         print(f"配置文件: {config_path}")
         print(f"设备: {device}")
         print(f"测试模式: {test_mode}")
         print(f"推理频率: {frequency} Hz")
-        print(f"调试日志目录: {debug_log_dir}")
-        print(f"保存频率: 每{save_frequency}步")
         
         # 检查相机状态
         self.policy.check_camera_status()
@@ -430,50 +549,15 @@ class ACTInferenceRunner:
                 'timestamp': time.monotonic()
             }
             
-            # 获取图像数据
-            current_images = self.camera_system.get_all_images()
-            
             # 执行策略
-            t_start = time.monotonic()
             cur_action = self.policy(obs)
-            t_end = time.monotonic()
-            
             joint_action = cur_action[:self.policy.joint_dim]
             gripper_action = cur_action[self.policy.joint_dim]
             
             print(f"预测的关节动作（7维）: {joint_action}")
             print(f"预测的夹爪动作（1维）: {gripper_action}")
             print(f"预测的完整动作（8维）: {cur_action}")
-            
-            # 记录调试数据
-            input_data = {
-                "cam_image": current_images.get("cam4"),
-                "eih_image": current_images.get("eih"),
-                "robot_state": obs['robot0_joint_pos'],
-                "gripper_state": obs['robot0_gripper_width'][0]
-            }
-            
-            output_data = {
-                "joint_action": joint_action,
-                "gripper_action": gripper_action,
-                "gripper_width": obs['robot0_gripper_width'][0],
-                "full_action": cur_action
-            }
-            
-            metadata = {
-                "inference_time": t_end - t_start,
-                "step": i,
-                "test_mode": True
-            }
-            
-            # 保存记录
-            record_id = self.logger.log_inference(input_data, output_data, metadata)
-            print(f"调试记录已保存: {record_id}")
-            
-            # 异常检测
-            anomalies = self.detector.detect_anomalies(input_data, output_data, metadata)
-            if anomalies:
-                print(f"⚠️  检测到异常: {anomalies}")
+            print(f"预测的夹爪动作: {gripper_action}")
             
             time.sleep(2)
     
@@ -520,9 +604,6 @@ class ACTInferenceRunner:
                 # 获取观测
                 obs = interface.get_observation()
                 
-                # 获取当前图像
-                current_images = self.camera_system.get_all_images()
-                
                 # 执行策略 - 添加超时检查
                 t_inference_start = time.monotonic()
                 try:
@@ -534,8 +615,8 @@ class ACTInferenceRunner:
                     inference_times.append(inference_time)
                     
                     # 更新最后有效的动作
-                    last_joint_action = cur_action.copy()
-                    last_gripper_action = cur_action[self.policy.joint_dim]
+                    last_joint_action = joint_action.copy()
+                    last_gripper_action = gripper_action.copy()
                     timeout_count = 0
                     
                 except Exception as e:
@@ -552,7 +633,7 @@ class ACTInferenceRunner:
                 
                 # 如果推理时间过长或剩余时间不足，使用降级策略
                 if (inference_time > max_inference_time or 
-                    remaining_time < 0.01):
+                    remaining_time < 0.01): # 剩余时间少于10ms):
                     
                     if last_joint_action is not None and last_gripper_action is not None:
                         # 使用上次的有效动作
@@ -560,61 +641,25 @@ class ACTInferenceRunner:
                         gripper_action = last_gripper_action
                         print(f"⚠️  使用降级策略: 推理时间={inference_time:.3f}s, 剩余时间={remaining_time:.3f}s")
                     else:
-                        # 不要使用当前位置，而是跳过这次执行
-                        print(f"⚠️  跳过执行，等待有效推理: 推理时间={inference_time:.3f}s")
-                        continue  # 跳过这次循环
+                        joint_action = obs['robot0_joint_pos'] + np.random.normal(0, 0.001, 7)
+                        print(f"⚠️  使用随机扰动动作，等待有效推理: 推理时间={inference_time:.3f}s")
+                        continue 
                 
-                # 记录调试数据
-                input_data = {
-                    "cam_image": current_images.get("cam4"),
-                    "eih_image": current_images.get("eih"),
-                    "robot_state": obs['robot0_joint_pos'],
-                    "gripper_state": obs['robot0_gripper_width'][0] if 'robot0_gripper_width' in obs else 0.04
-                }
-                
-                output_data = {
-                    "joint_action": joint_action,
-                    "gripper_action": gripper_action,
-                    "gripper_width": obs['robot0_gripper_width'][0] if 'robot0_gripper_width' in obs else 0.04,
-                    "full_action": cur_action
-                }
-                
-                metadata = {
-                    "inference_time": inference_time,
-                    "step": step,
-                    "timeout_count": timeout_count,
-                    "n_action_steps": self.policy.policy.config.n_action_steps,
-                    "chunk_size": self.policy.policy.config.chunk_size
-                }
-                
-                # 保存记录
-                record_id = self.logger.log_inference(input_data, output_data, metadata)
-                
-                # 异常检测
-                anomalies = self.detector.detect_anomalies(input_data, output_data, metadata)
-                if anomalies:
-                    print(f"⚠️  检测到异常: {anomalies}")
-                
-                # 执行动作
                 interface.execute_action(joint_action)
                 interface.execute_gripper_action(gripper_action)
                 
-                # 每10步打印一次详细信息
                 if step % 10 == 0:
                     current_time = time.monotonic() - t_start
                     avg_inference_time = np.mean(inference_times[-10:]) if len(inference_times) >= 10 else np.mean(inference_times)
                     print(f"Step {step}: 时间={current_time:.2f}s, 推理时间={inference_time:.3f}s (平均={avg_inference_time:.3f}s)")
                     print(f"  关节动作: {joint_action}")
                     print(f"  Gripper动作: {gripper_action}")
-                    print(f"  记录ID: {record_id}")
                     if timeout_count > 0:
                         print(f"  超时次数: {timeout_count}")
-                    if anomalies:
-                        print(f"  异常: {anomalies}")
                 
                 step += 1
                 
-                # 使用precise_wait等待到下一个周期
+                # 等待到下一个周期
                 precise_wait(t_cycle_end)
                 
         except KeyboardInterrupt:
@@ -624,17 +669,6 @@ class ACTInferenceRunner:
             import traceback
             traceback.print_exc()
         finally:
-            # 保存会话总结
-            print("\n保存调试数据...")
-            summary_file = self.logger.save_session_summary()
-            stats = self.logger.get_stats()
-            print(f"调试数据已保存:")
-            print(f"  总步数: {stats['total_steps']}")
-            print(f"  已保存步数: {stats['saved_steps']}")
-            print(f"  平均推理时间: {stats['avg_inference_time']:.3f}s")
-            print(f"  异常检测次数: {self.detector.get_anomaly_stats()['anomaly_count']}")
-            print(f"  会话总结: {summary_file}")
-            
             # 停止策略接口
             if 'interface' in locals():
                 print("停止策略接口...")
@@ -648,54 +682,69 @@ class ACTInferenceRunner:
 
 def main():
     """主函数"""
-    # 设置默认参数，不需要命令行传参
-    args = type('Args', (), {
-        'model_path': "./outputs/train/act_franka_dataset/checkpoints/050000",  # 默认模型路径
-        'device': "cuda",  # 默认使用GPU
-        'config_path': "./config/robot_config.yaml",  # 默认配置文件路径
-        'max_steps': 1000,  # 默认最大步数
-        'test_mode': False,  # 默认使用实时模式（安全）
-        'frequency': 10.0,  # 默认推理频率
-        'debug_image': False,  # 默认不显示图像调试信息
-        'debug_log_dir': "debug_logs",  # 默认调试日志目录
-        'save_frequency': 1  # 默认每步都保存
-    })()
+    parser = argparse.ArgumentParser(
+        description="基于RISE模型的实时推理脚本",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     
-    print("🔧 使用默认参数:")
-    print(f"  模型路径: {args.model_path}")
-    print(f"  设备: {args.device}")
-    print(f"  配置文件: {args.config_path}")
-    print(f"  最大步数: {args.max_steps}")
-    print(f"  测试模式: {args.test_mode}")
-    print(f"  推理频率: {args.frequency} Hz")
-    print(f"  调试日志目录: {args.debug_log_dir}")
-    print(f"  保存频率: 每{args.save_frequency}步")
-    print("💡 如需修改参数，请直接编辑脚本中的默认值")
+    # 设置默认路径（相对于当前脚本位置）
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent.parent
     
-    # 检查配置文件
-    if not os.path.exists(args.config_path):
-        print(f"⚠️  配置文件不存在: {args.config_path}")
-        print("💡 请确保配置文件路径正确，或修改脚本中的默认路径")
-        return 1
+    parser.add_argument("--model_path", type=str, 
+                       default="policy_last.ckpt",
+                       help="训练好的RISE模型路径")
+    parser.add_argument("--device", type=str, default="cuda",
+                       help="计算设备 (cpu/cuda)")
+    parser.add_argument("--config_path", type=str,
+                       default=str(script_dir.parent / "config" / "robot_config.yaml"),
+                       help="机器人配置文件路径")
+    parser.add_argument("--max_steps", type=int, default=1000,
+                       help="最大运行步数")
+    parser.add_argument("--test_mode", action="store_true", default=True,
+                       help="测试模式（不连接真实机器人）")
+    parser.add_argument("--frequency", type=float, default=5.0,
+                       help="推理频率 (Hz) - RISE模型推理较慢，建议5Hz")
+    parser.add_argument("--debug_image", action="store_true", default=False,
+                       help="显示图像处理调试信息")
     
-    # 检查模型路径
+    args = parser.parse_args()
+    
+    # 检查并设置模型路径
     if not os.path.exists(args.model_path):
-        print(f"⚠️  模型路径不存在: {args.model_path}")
-        print("💡 请确保模型路径正确，或修改脚本中的默认路径")
+        print(f"⚠️  默认模型路径不存在: {args.model_path}")
         return 1
     
-    # 创建并运行ACT推理运行器
+    # 检查并设置配置文件路径
+    if not os.path.exists(args.config_path):
+        print(f"⚠️  默认配置文件不存在: {args.config_path}")
+        return 1
+    
+    print(f"📁 使用模型路径: {args.model_path}")
+    print(f"📁 使用配置文件: {args.config_path}")
+    print(f"🎯 测试模式: {args.test_mode}")
+    print(f"⚡ 推理频率: {args.frequency} Hz")
+    print(f"🖥️  计算设备: {args.device}")
+    print("-" * 50)
+    
+    print("🚀 启动RISE推理系统...")
+    if args.test_mode:
+        print("📝 运行在测试模式 - 不会连接真实机器人")
+    else:
+        print("⚠️  运行在实时模式 - 将连接真实机器人!")
+        print("   请确保机器人已正确连接并处于安全状态")
+    print("-" * 50)
+    
+    # 创建并运行RISE推理运行器
     try:
-        runner = ACTInferenceRunner(
+        runner = RISEInferenceRunner(
             model_path=args.model_path,
             config_path=args.config_path,
             device=args.device,
             max_steps=args.max_steps,
             test_mode=args.test_mode,
             frequency=args.frequency,
-            debug_image=args.debug_image,
-            debug_log_dir=args.debug_log_dir,
-            save_frequency=args.save_frequency
+            debug_image=args.debug_image
         )
         
         # 执行推理

@@ -11,6 +11,7 @@ from shared_memory.shared_memory_queue import (
     SharedMemoryQueue, Empty)
 from shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from common.joint_trajectory_interpolator import JointTrajectoryInterpolator
+from common.pose_trajectory_interpolator import PoseTrajectoryInterpolator
 from common.precise_sleep import precise_wait
 import torch
 from common.pose_util import pose_to_mat, mat_to_pose
@@ -20,6 +21,7 @@ class Command(enum.Enum):
     STOP = 0
     SERVOL = 1
     SCHEDULE_WAYPOINT = 2
+    SCHEDULE_WAYPOINT_POSE = 3
 
 # Franka末端执行器变换矩阵
 tx_flangerot90_tip = np.identity(4)
@@ -107,6 +109,7 @@ class FrankaInterpolationController(mp.Process):
         joints_init=None,
         joints_init_duration=3,
         soft_real_time=False,
+        use_joint_interp=True,
         verbose=False,
         get_max_k=None,
         receive_latency=0.0
@@ -132,6 +135,7 @@ class FrankaInterpolationController(mp.Process):
         self.soft_real_time = soft_real_time
         self.receive_latency = receive_latency
         self.verbose = verbose
+        self.use_joint_interp = use_joint_interp
 
         if get_max_k is None:
             get_max_k = int(frequency * 5)
@@ -246,7 +250,19 @@ class FrankaInterpolationController(mp.Process):
         # print(f"[schedule_waypoint调试] 队列大小: {self.input_queue.qsize()}")
         
         self.input_queue.put(message)
-    
+
+    def schedule_waypoint_pose(self, pose, target_time):
+        """调度路径点姿态"""
+        pose = np.array(pose)
+        assert pose.shape == (6,)
+        
+        message = {
+            'cmd': Command.SCHEDULE_WAYPOINT_POSE.value,
+            'target_pose': pose,
+            'target_time': target_time
+        }
+        self.input_queue.put(message)
+
     # ========= 接收API =============
     def get_state(self, k=None, out=None):
         if k is None:
@@ -294,22 +310,30 @@ class FrankaInterpolationController(mp.Process):
 
             # 主循环
             dt = 1. / self.frequency
-            print(1)
             curr_joints = self.robot.get_joint_positions()
-            print(2)
+            curr_pose = self.robot.get_ee_pose()
 
             # 使用单调时间确保控制循环永不倒退
             curr_t = time.monotonic()
             last_waypoint_time = curr_t
             # 创建关节轨迹插值器
-            joint_interp = JointTrajectoryInterpolator(
-                times=np.array([curr_t]),
-                joints=curr_joints.reshape(1, -1)
-            )
-
-            # 启动franka关节位置控制策略
-            # 注意：这里可能需要根据实际机器人接口调整
-            self.robot.start_joint_impedance()
+            if self.use_joint_interp:
+                joint_interp = JointTrajectoryInterpolator(
+                    times=np.array([curr_t]),
+                    joints=curr_joints.reshape(1, -1)
+                )
+                # 启动franka关节位置控制策略
+                # 注意：这里可能需要根据实际机器人接口调整
+                self.robot.start_joint_impedance()
+            else:
+                pose_interp = PoseTrajectoryInterpolator(
+                    times=np.array([curr_t]),
+                    poses=curr_pose.reshape(1, -1)
+                )
+                self.robot.start_cartesian_impedance(
+                    Kx=self.Kx,
+                    Kxd=self.Kxd
+                )
 
             t_start = time.monotonic()
             iter_idx = 0
@@ -319,12 +343,14 @@ class FrankaInterpolationController(mp.Process):
                 # 向机器人发送命令
                 t_now = time.monotonic()
                 # 使用关节插值器获取目标关节位置
-                target_joints = joint_interp(t_now)
-                # print("xxxxxxxx")
-                # print(f"[控制器调试] 目标关节: {target_joints}")
-
-                # 向机器人发送关节位置命令
-                self.robot.update_desired_joint_positions(target_joints)
+                if self.use_joint_interp:
+                    target_joints = joint_interp(t_now)
+                    # 向机器人发送关节位置命令
+                    self.robot.update_desired_joint_positions(target_joints)
+                else:
+                    target_pose = pose_interp(t_now)
+                    # 向机器人发送末端执行器姿态命令
+                    self.robot.update_desired_ee_pose(target_pose)
 
                 # 更新机器人状态
                 state = dict()
@@ -398,6 +424,16 @@ class FrankaInterpolationController(mp.Process):
                             joints=target_joints,
                             time=target_time,
                             max_joint_speed=2.0,  # 最大关节速度 2 rad/s
+                            curr_time=curr_time,
+                            last_waypoint_time=last_waypoint_time
+                        )
+                        last_waypoint_time = target_time
+                    elif cmd == Command.SCHEDULE_WAYPOINT_POSE.value:
+                        target_pose = command['target_pose']
+                        target_time = float(command['target_time'])
+                        pose_interp = pose_interp.schedule_waypoint_pose(
+                            pose=target_pose,
+                            time=target_time,
                             curr_time=curr_time,
                             last_waypoint_time=last_waypoint_time
                         )
