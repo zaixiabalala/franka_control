@@ -194,14 +194,6 @@ def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_spee
                     # 深度保存为 PNG（优先 uint16）
                     if depth_img is not None:
                         depth_to_save = depth_img
-                        if depth_to_save.dtype != np.uint16:
-                            # 归一化/米→毫米到 uint16（保守处理）
-                            if depth_to_save.max() <= 10.0:
-                                depth_to_save = (depth_to_save * 1000.0).astype(np.uint16)
-                            else:
-                                depth_norm = depth_to_save.astype(np.float32)
-                                depth_norm = (depth_norm / (depth_norm.max() + 1e-6)) * 65535.0
-                                depth_to_save = depth_norm.astype(np.uint16)
                         cv2.imwrite(os.path.join(cam_dirs[cam_name]['depth'], frame_id + '.png'), depth_to_save)
 
                 iter_idx += 1

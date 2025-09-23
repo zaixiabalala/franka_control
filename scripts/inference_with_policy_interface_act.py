@@ -26,23 +26,19 @@ model_lerobot_path = project_dir / "model" / "lerobot" / "src"
 sys.path.insert(0, str(model_lerobot_path))
 sys.path.insert(0, str(project_dir))  # 添加项目根目录到路径
 
-# 导入最新版本的lerobot库
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.constants import OBS_IMAGES, ACTION, OBS_STATE
 
-# 导入PolicyInterface
 from policy_interface import create_policy_interface
 
-# 导入precise_wait
 from common.precise_sleep import precise_wait
 
-# 相机相关导入
 import pyrealsense2 as rs
 from r3kit.devices.camera.realsense import config as rs_cfg
 from r3kit.devices.camera.realsense.d415 import D415
 R3KIT_RS_AVAILABLE = True
 
-# D415 相机配置（与采集脚本保持一致）
+# D415 相机配置
 FPS = 30
 D415_CAMERAS = {   
     "cam4": "327322062498",  # 固定机位视角
@@ -50,7 +46,7 @@ D415_CAMERAS = {
 }
 
 class CameraSystem:
-    """相机系统接口 - 从inference_poly1复用"""
+    """相机系统接口"""
     
     def __init__(self):
         self.cameras = {}
@@ -443,7 +439,7 @@ class ACTInferenceRunner:
             last_joint_action = None
             last_gripper_action = None
             inference_times = []
-            max_inference_time = 0.18  # 最大允许推理时间 (180ms) - 针对130ms推理时间优化
+            max_inference_time = 0.18  # 最大允许推理时间 (180ms)
             timeout_count = 0
             
             while True:
@@ -487,7 +483,7 @@ class ACTInferenceRunner:
                 
                 # 如果推理时间过长或剩余时间不足，使用降级策略
                 if (inference_time > max_inference_time or 
-                    remaining_time < 0.01): # 剩余时间少于10ms):
+                    remaining_time < 0.01): # 剩余时间少于10ms
                     
                     if last_joint_action is not None and last_gripper_action is not None:
                         # 使用上次的有效动作
@@ -526,19 +522,16 @@ class ACTInferenceRunner:
             import traceback
             traceback.print_exc()
         finally:
-            # 停止策略接口
             if 'interface' in locals():
                 print("停止策略接口...")
                 interface.stop()
     
     def cleanup(self):
-        """清理资源"""
         if hasattr(self, 'camera_system'):
             self.camera_system.close()
 
 
 def main():
-    """主函数"""
     parser = argparse.ArgumentParser(description="基于相机和ACT模型的实时推理脚本 - 更新版本")
     parser.add_argument("--model_path", type=str, 
                        default="/home/robotflow/Downloads/050000/pretrained_model",
@@ -559,17 +552,14 @@ def main():
     
     args = parser.parse_args()
     
-    # 检查配置文件
     if not os.path.exists(args.config_path):
         print(f"错误: 配置文件不存在: {args.config_path}")
         return 1
     
-    # 检查模型路径
     if not os.path.exists(args.model_path):
         print(f"错误: 模型路径不存在: {args.model_path}")
         return 1
     
-    # 创建并运行ACT推理运行器
     try:
         runner = ACTInferenceRunner(
             model_path=args.model_path,
@@ -581,7 +571,6 @@ def main():
             debug_image=args.debug_image
         )
         
-        # 执行推理
         runner.run()
         
     except Exception as e:
@@ -590,7 +579,6 @@ def main():
         traceback.print_exc()
         return 1
     finally:
-        # 清理资源
         if 'runner' in locals():
             runner.cleanup()
     

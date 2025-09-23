@@ -79,14 +79,14 @@ D415_CAMERAS = {
 }
 
 class CameraSystem:
-    """相机系统接口 - 从inference_poly1复用"""
+    """相机系统接口"""
     
     def __init__(self):
         self.cameras = {}
         self.camera_names = ["cam4", "eih"]  # 支持双视角
         self.use_realsense = True
         
-        # 与采集脚本保持一致的流配置
+        # 流配置
         rs_cfg.D415_STREAMS = [
             (rs.stream.depth, 640,480, rs.format.z16, FPS),
             (rs.stream.color, 640,480, rs.format.bgr8, FPS),
@@ -122,7 +122,7 @@ class CameraSystem:
                 color, depth = self.cameras[cam_name].get()
                 if color is None:
                     return None
-                # 转 RGB（下游预处理默认以 RGB 处理）
+                # 转 RGB
                 frame_rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
                 return frame_rgb
             else:
@@ -136,33 +136,20 @@ class CameraSystem:
             print(f"获取 {cam_name} 图像失败: {e}")
             return None
     
-    def get_image_and_depth(self, cam_name):
-        """获取指定相机的RGB和深度图像"""
+    def get_depth(self, cam_name):
+        """获取指定相机的深度"""
         if cam_name not in self.cameras:
-            return None, None
+            return None
         
         try:
             if self.use_realsense:
                 # r3kit D415 接口
                 color, depth = self.cameras[cam_name].get()
-                if color is None or depth is None:
-                    return None, None
-                # 转 RGB
-                frame_rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
-                return frame_rgb, depth
-            else:
-                # OpenCV 摄像头 - 生成模拟深度图
-                ret, frame = self.cameras[cam_name].read()
-                if ret:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # 生成模拟深度图（实际使用时需要真实深度相机）
-                    fake_depth = np.ones((frame_rgb.shape[0], frame_rgb.shape[1]), dtype=np.float32) * 0.5
-                    return frame_rgb, fake_depth
-                return None, None
+                return depth
         except Exception as e:
-            print(f"获取 {cam_name} 图像和深度失败: {e}")
-            return None, None
-    
+            print(f"获取 {cam_name} 深度失败: {e}")
+            return None
+
     def get_all_images(self):
         """获取所有相机的图像"""
         images = {}
@@ -177,15 +164,24 @@ class CameraSystem:
         
         return images
     
+    def get_image_and_depth(self, cam_name):
+        """获取指定相机的图像和深度"""
+        if cam_name not in self.cameras:
+            return None, None
+        
+        return self.get_image(cam_name), self.get_depth(cam_name)
+    
     def close(self):
         """关闭所有相机"""
         for cam_name, cap in self.cameras.items():
             try:
                 if self.use_realsense:
+                    # D415 类可能没有 stop 方法，使用 __del__ 或者不做任何操作
                     if hasattr(cap, 'stop'):
                         cap.stop()
                     elif hasattr(cap, 'close'):
                         cap.close()
+                    # 对于 r3kit D415，通常由析构函数自动处理
                 else:
                     cap.release()
                 print(f"{cam_name} 已关闭")
