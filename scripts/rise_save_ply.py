@@ -226,6 +226,22 @@ class RISEPolicyWrapper:
         self.dropout = 0.1  # dropout率
         self.action_queue = []
         
+        # 调试与点云保存配置
+        self.dump_limit = 20
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.dump_dir = Path("debug_pointclouds") / timestamp
+        try:
+            self.dump_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self.dump_count = 0
+        self._debug_cache = {
+            "raw_points": None,
+            "raw_colors": None,
+            "proc_points": None,
+            "proc_colors": None,
+        }
+        
         # 加载模型
         self.policy = self._load_policy()
         
@@ -293,6 +309,10 @@ class RISEPolicyWrapper:
         points = np.array(cloud.points).astype(np.float32)
         colors = np.array(cloud.colors).astype(np.float32)
 
+        # 记录下采样后的原始点云（未裁剪/未归一化）
+        raw_points = points.copy()
+        raw_colors = colors.copy()
+
         # 工作空间裁剪
         x_mask = ((points[:, 0] >= WORKSPACE_MIN[0]) & (points[:, 0] <= WORKSPACE_MAX[0]))
         y_mask = ((points[:, 1] >= WORKSPACE_MIN[1]) & (points[:, 1] <= WORKSPACE_MAX[1]))
@@ -302,10 +322,17 @@ class RISEPolicyWrapper:
         colors = colors[mask]
         
         # ImageNet归一化
-        colors = (colors - IMG_MEAN) / IMG_STD
+        colors_norm = (colors - IMG_MEAN) / IMG_STD
         
         # 合并点和颜色
-        cloud_final = np.concatenate([points, colors], axis=-1).astype(np.float32)
+        cloud_final = np.concatenate([points, colors_norm], axis=-1).astype(np.float32)
+
+        # 保存处理后的（传入策略前的）点云缓存
+        self._debug_cache["raw_points"] = raw_points
+        self._debug_cache["raw_colors"] = raw_colors
+        self._debug_cache["proc_points"] = points
+        self._debug_cache["proc_colors"] = colors  # 非归一化，用于可视化
+
         return cloud_final
     
     def create_batch(self, coords, feats):
@@ -346,7 +373,69 @@ class RISEPolicyWrapper:
             coords = np.clip(coords, -100000, 100000)
         
         coords_batch, feats_batch = self.create_batch(coords, cloud)
+
+        # 条件保存点云（最多20帧，不影响推理流程）
+        try:
+            if self.dump_count < self.dump_limit and self.dump_dir is not None:
+                self._dump_pointclouds(coords=coords, cloud=cloud)
+                self.dump_count += 1
+        except Exception:
+            pass
+
         return coords_batch, feats_batch, cloud
+
+    def _dump_pointclouds(self, coords: np.ndarray, cloud: np.ndarray):
+        """保存一帧点云到磁盘，包括：
+        - raw: 下采样后但未裁剪/未归一化的点云（PLY/NPZ）
+        - proc: 裁剪后用于策略的点云（去裁剪后的 points 与未归一化 colors）（PLY/NPZ）
+        - final: 稀疏坐标（int）与还原空间坐标（PLY/NPZ）
+        """
+        idx = f"{self.dump_count:04d}"
+        raw_pts = self._debug_cache.get("raw_points")
+        raw_cols = self._debug_cache.get("raw_colors")
+        proc_pts = self._debug_cache.get("proc_points")
+        proc_cols = self._debug_cache.get("proc_colors")
+
+        # 还原用于可视化的颜色到 [0,1]
+        def make_o3d_pcd(points_f32: np.ndarray, colors_f32: np.ndarray):
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points_f32.astype(np.float64))
+            colors_vis = np.clip(colors_f32, 0.0, 1.0)
+            pcd.colors = o3d.utility.Vector3dVector(colors_vis.astype(np.float64))
+            return pcd
+
+        # 保存 raw 点云
+        if raw_pts is not None and raw_cols is not None and len(raw_pts) > 0:
+            pcd_raw = make_o3d_pcd(raw_pts, raw_cols)
+            o3d.io.write_point_cloud(str(self.dump_dir / f"{idx}_raw.ply"), pcd_raw, write_ascii=True)
+
+        # 保存 proc 点云（裁剪后，颜色反归一化用于可视化）
+        if proc_pts is not None and proc_cols is not None and len(proc_pts) > 0:
+            # 反归一化可视化
+            proc_cols_vis = np.clip(proc_cols, 0.0, 1.0)
+            pcd_proc = make_o3d_pcd(proc_pts, proc_cols_vis)
+            o3d.io.write_point_cloud(str(self.dump_dir / f"{idx}_proc.ply"), pcd_proc, write_ascii=True)
+
+        # 保存 final 稀疏坐标（将体素坐标还原为米）
+        if coords is not None and len(coords) > 0:
+            coords_xyz = coords.astype(np.float32) * float(self.voxel_size)
+            # 与 proc_pts 对齐（长度应一致）
+            final_cols = proc_cols if (proc_cols is not None and len(proc_cols) == len(coords_xyz)) else np.ones_like(coords_xyz)
+            final_cols_vis = np.clip(final_cols, 0.0, 1.0)
+            pcd_final = make_o3d_pcd(coords_xyz, final_cols_vis)
+            o3d.io.write_point_cloud(str(self.dump_dir / f"{idx}_final_sparse.ply"), pcd_final, write_ascii=True)
+
+        # 保存数值数据为 npz
+        np.savez_compressed(
+            str(self.dump_dir / f"{idx}_data.npz"),
+            raw_points=raw_pts,
+            raw_colors=raw_cols,
+            proc_points=proc_pts,
+            proc_colors=proc_cols,
+            final_coords_int=coords,
+            final_coords_xyz=(coords.astype(np.float32) * float(self.voxel_size)) if coords is not None else None,
+            cloud_to_policy=cloud,  # (N,6) = [x,y,z, r_norm,g_norm,b_norm]
+        )
     
     def unnormalize_action(self, action):
         """
@@ -406,8 +495,8 @@ class RISEPolicyWrapper:
         
         # 获取原始图像尺寸
         h, w = image.shape[:2]
-        start_w = 200
-        end_w = 560
+        start_w = 180
+        end_w = 540
         start_h = 0
         end_h = 360
 
