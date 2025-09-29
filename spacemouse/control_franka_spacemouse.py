@@ -118,7 +118,6 @@ def main(robot_hostname, gripper_hostname, gripper_port, frequency, gripper_spee
                 # print(1/(time.time() -s))
 
 
-    controller.terminate_current_policy()
 # %%
 if __name__ == '__main__':
     main()

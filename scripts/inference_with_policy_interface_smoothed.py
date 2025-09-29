@@ -695,7 +695,7 @@ def main():
                        help="推理频率 (Hz) - 针对130ms推理时间优化")
     parser.add_argument("--debug_image", action="store_true", default=False,
                        help="显示图像处理调试信息")
-    parser.add_argument("--use_eih", action="store_true", default=True,  # 新增
+    parser.add_argument("--use_eih", action="store_true", default=False,  # 新增
                        help="使用eye-in-hand视角作为输入")
     args = parser.parse_args()
     
