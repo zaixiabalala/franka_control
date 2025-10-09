@@ -105,7 +105,7 @@ class FrankaInterface:
             return 0.04
     
     def move_gripper_to_width(self, width, speed=None, force=None):
-        """移动gripper到指定宽度"""
+        """移动gripper到指定宽度（使用 move 命令）"""
         if self.gripper is None:
             print("Gripper未初始化，跳过控制")
             return False
@@ -125,6 +125,76 @@ class FrankaInterface:
         except Exception as e:
             print(f"移动gripper失败: {e}")
             return False
+    
+    def grasp_gripper(self, width=0.0, speed=0.05, force=20.0, 
+                      epsilon_inner=0.005, epsilon_outer=0.005):
+        """
+        【新增】使用 grasp 命令抓取物体
+        
+        与 move_gripper_to_width 的区别：
+        - grasp 允许在接触到物体时提前停止（在 epsilon 范围内即可）
+        - grasp 会施加指定的力来夹紧物体
+        - grasp 不会因为遇到物体阻挡而失败并抛异常
+        
+        Args:
+            width: 目标宽度 (米)，通常设为 0 或很小的值（默认 0.0）
+            speed: 闭合速度 (m/s)，建议 0.05-0.1（默认 0.05）
+            force: 夹持力 (N)，建议 20-40（默认 20.0）
+            epsilon_inner: 内侧容差 (米)，默认 5mm（默认 0.005）
+            epsilon_outer: 外侧容差 (米)，默认 5mm（默认 0.005）
+            
+        Returns:
+            结果字典：{'success': bool, 'actual_width': float, 'message': str}
+        """
+        if self.gripper is None:
+            print("Gripper未初始化，跳过grasp控制")
+            return {
+                'success': False,
+                'actual_width': 0.0,
+                'message': 'Gripper未初始化'
+            }
+        
+        try:
+            # 限制宽度范围
+            width = float(np.clip(width, 0.0, 0.08))
+            
+            print(f"[FrankaInterface] 执行 GRASP: width={width*1000:.1f}mm, "
+                  f"speed={speed:.3f}m/s, force={force:.1f}N")
+            
+            # 【正确用法】根据 Polymetis 源码和官方示例：
+            # 1. 不传 epsilon 参数，使用默认 -1.0（最大容差，确保持续施力）
+            # 2. 参数顺序：speed, force, grasp_width
+            self.gripper.grasp(
+                speed=speed,              # 第1个参数：速度
+                force=force,              # 第2个参数：力  
+                grasp_width=width,        # 第3个参数：目标宽度
+                # 【关键】不传 epsilon，使用默认 -1.0（特殊值，表示最大容差）
+                # 这样无论实际停在哪个宽度，都会持续施力
+                blocking=True             # 阻塞等待完成
+            )
+            
+            print(f"[FrankaInterface] Grasp 命令已发送（使用默认 epsilon=-1.0 确保持续施力）")
+            
+            # 获取实际宽度
+            actual_width = self.get_gripper_width()
+            
+            result = {
+                'success': True,  # grasp 不返回值，能执行完就是成功
+                'actual_width': float(actual_width),
+                'message': 'Grasp成功'
+            }
+            
+            print(f"[FrankaInterface] Grasp结果: {result}")
+            return result
+            
+        except Exception as e:
+            error_msg = f"Grasp执行失败: {e}"
+            print(f"[FrankaInterface] {error_msg}")
+            return {
+                'success': False,
+                'actual_width': self.get_gripper_width(),
+                'message': error_msg
+            }
 
 def main():
     """启动ZeroRPC服务器"""

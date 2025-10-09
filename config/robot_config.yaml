@@ -29,8 +29,16 @@ gripper:
   frequency: 30 # 控制频率 (Hz)
   move_max_speed: 200.0 # 最大移动速度
 
+  # Grasp 相关参数 (新增)
+  use_grasp_for_closing: true  # 闭合时是否使用grasp而非move
+  grasp_threshold: 0.005       # 5mm，闭合超过此阈值时触发grasp
+  grasp_speed: 0.03            # grasp速度 (m/s) - 稍慢一点让接触更稳定
+  grasp_force: 55.0            # grasp力 (N) - 增大到40N防止物体掉落
+  grasp_epsilon_inner: 0.003   # grasp内侧容差 (m)，5mm
+  grasp_epsilon_outer: 0.003   # grasp外侧容差 (m)，5mm
+
   # 调试
-  verbose: false
+  verbose: true  # 建议开启以观察grasp/move切换
 
 # 共享内存配置
 shared_memory:

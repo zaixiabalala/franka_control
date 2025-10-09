@@ -47,7 +47,7 @@ from common.gripper_util import convert_gripper_width_to_encoder
 
 # 导入 RISE 策略（基于 my_train.py 和 eval.py）
 import sys
-rise_path = Path(__file__).parent.parent / "RISE"
+rise_path = Path(__file__).parent.parent / "RISE1"
 sys.path.insert(0, str(rise_path))
 
 # 添加RISE依赖路径
@@ -406,8 +406,8 @@ class RISEPolicyWrapper:
         
         # 获取原始图像尺寸
         h, w = image.shape[:2]
-        start_w = 200
-        end_w = 560
+        start_w = 180
+        end_w = 540
         start_h = 0
         end_h = 360
 
