@@ -18,6 +18,7 @@
   - 基于点云的RISE策略推理
   - 实时机器人控制（可选）
   - 智能路径搜索和错误处理
+  - 支持保存推理时的RGB图像和深度图
 """
 
 import os
@@ -47,7 +48,7 @@ from common.gripper_util import convert_gripper_width_to_encoder
 
 # 导入 RISE 策略（基于 my_train.py 和 eval.py）
 import sys
-rise_path = Path(__file__).parent.parent / "RISE"
+rise_path = Path(__file__).parent.parent / "RISE1"
 sys.path.insert(0, str(rise_path))
 
 # 添加RISE依赖路径
@@ -89,10 +90,28 @@ D415_CAMERAS = {
 class CameraSystem:
     """相机系统接口"""
     
-    def __init__(self):
+    def __init__(self, save_images: bool = False, save_dir: str = None):
         self.cameras = {}
         self.camera_names = ["cam4"]  # 支持双视角
         self.use_realsense = True
+        self.save_images = bool(save_images)
+        # 组织保存目录
+        if self.save_images:
+            if save_dir is None or len(str(save_dir).strip()) == 0:
+                # 默认保存到 runs/inference_images/<timestamp>
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                save_dir = os.path.join("runs", "inference_images", ts)
+            self.save_root = str(save_dir)
+            self.save_cam4_dir = os.path.join(self.save_root, "cam4")
+            self.save_depth_dir = os.path.join(self.save_root, "depth")
+            os.makedirs(self.save_cam4_dir, exist_ok=True)
+            os.makedirs(self.save_depth_dir, exist_ok=True)
+            print(f"图像保存已启用: {self.save_root}")
+        else:
+            self.save_root = None
+            self.save_cam4_dir = None
+            self.save_depth_dir = None
+        self._save_step = 0
         
         # 流配置
         rs_cfg.D415_STREAMS = [
@@ -161,14 +180,47 @@ class CameraSystem:
     def get_all_images(self):
         """获取所有相机的图像"""
         images = {}
+        depths = {}
         for cam_name in self.camera_names:
             image = self.get_image(cam_name)
+            depth = self.get_depth(cam_name)
             if image is not None:
                 images[cam_name] = image
             else:
                 # 生成模拟图像作为 fallback
                 images[cam_name] = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
                 print(f"警告: {cam_name} 相机图像获取失败，使用模拟图像")
+            
+            if depth is not None:
+                depths[cam_name] = depth
+            else:
+                # 生成模拟深度图作为 fallback
+                depths[cam_name] = np.ones((480, 640), dtype=np.uint16) * 500  # 模拟500mm深度
+                print(f"警告: {cam_name} 相机深度获取失败，使用模拟深度")
+        
+        # 如启用保存，则按步序号保存RGB图像和深度图
+        if self.save_images and len(images) > 0:
+            step_str = f"{self._save_step:06d}"
+            for cam_name, img_rgb in images.items():
+                try:
+                    # 保存RGB图像（转回BGR以兼容cv2.imwrite）
+                    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                    if cam_name == "cam4" and self.save_cam4_dir is not None:
+                        out_path = os.path.join(self.save_cam4_dir, f"{step_str}.jpg")
+                        cv2.imwrite(out_path, img_bgr)
+                except Exception as e:
+                    print(f"保存RGB图像失败: {e}")
+            
+            # 保存深度图
+            for cam_name, depth_img in depths.items():
+                try:
+                    if cam_name == "cam4" and self.save_depth_dir is not None:
+                        out_path = os.path.join(self.save_depth_dir, f"{step_str}.png")
+                        cv2.imwrite(out_path, depth_img)
+                except Exception as e:
+                    print(f"保存深度图失败: {e}")
+            
+            self._save_step += 1
         
         return images
     
@@ -225,22 +277,6 @@ class RISEPolicyWrapper:
         self.num_decoder_layers = 1  # 解码器层数
         self.dropout = 0.1  # dropout率
         self.action_queue = []
-        
-        # 调试与点云保存配置
-        self.dump_limit = 20
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.dump_dir = Path("debug_pointclouds") / timestamp
-        try:
-            self.dump_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        self.dump_count = 0
-        self._debug_cache = {
-            "raw_points": None,
-            "raw_colors": None,
-            "proc_points": None,
-            "proc_colors": None,
-        }
         
         # 加载模型
         self.policy = self._load_policy()
@@ -309,10 +345,6 @@ class RISEPolicyWrapper:
         points = np.array(cloud.points).astype(np.float32)
         colors = np.array(cloud.colors).astype(np.float32)
 
-        # 记录下采样后的原始点云（未裁剪/未归一化）
-        raw_points = points.copy()
-        raw_colors = colors.copy()
-
         # 工作空间裁剪
         x_mask = ((points[:, 0] >= WORKSPACE_MIN[0]) & (points[:, 0] <= WORKSPACE_MAX[0]))
         y_mask = ((points[:, 1] >= WORKSPACE_MIN[1]) & (points[:, 1] <= WORKSPACE_MAX[1]))
@@ -322,17 +354,10 @@ class RISEPolicyWrapper:
         colors = colors[mask]
         
         # ImageNet归一化
-        colors_norm = (colors - IMG_MEAN) / IMG_STD
+        colors = (colors - IMG_MEAN) / IMG_STD
         
         # 合并点和颜色
-        cloud_final = np.concatenate([points, colors_norm], axis=-1).astype(np.float32)
-
-        # 保存处理后的（传入策略前的）点云缓存
-        self._debug_cache["raw_points"] = raw_points
-        self._debug_cache["raw_colors"] = raw_colors
-        self._debug_cache["proc_points"] = points
-        self._debug_cache["proc_colors"] = colors  # 非归一化，用于可视化
-
+        cloud_final = np.concatenate([points, colors], axis=-1).astype(np.float32)
         return cloud_final
     
     def create_batch(self, coords, feats):
@@ -373,69 +398,7 @@ class RISEPolicyWrapper:
             coords = np.clip(coords, -100000, 100000)
         
         coords_batch, feats_batch = self.create_batch(coords, cloud)
-
-        # 条件保存点云（最多20帧，不影响推理流程）
-        try:
-            if self.dump_count < self.dump_limit and self.dump_dir is not None:
-                self._dump_pointclouds(coords=coords, cloud=cloud)
-                self.dump_count += 1
-        except Exception:
-            pass
-
         return coords_batch, feats_batch, cloud
-
-    def _dump_pointclouds(self, coords: np.ndarray, cloud: np.ndarray):
-        """保存一帧点云到磁盘，包括：
-        - raw: 下采样后但未裁剪/未归一化的点云（PLY/NPZ）
-        - proc: 裁剪后用于策略的点云（去裁剪后的 points 与未归一化 colors）（PLY/NPZ）
-        - final: 稀疏坐标（int）与还原空间坐标（PLY/NPZ）
-        """
-        idx = f"{self.dump_count:04d}"
-        raw_pts = self._debug_cache.get("raw_points")
-        raw_cols = self._debug_cache.get("raw_colors")
-        proc_pts = self._debug_cache.get("proc_points")
-        proc_cols = self._debug_cache.get("proc_colors")
-
-        # 还原用于可视化的颜色到 [0,1]
-        def make_o3d_pcd(points_f32: np.ndarray, colors_f32: np.ndarray):
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points_f32.astype(np.float64))
-            colors_vis = np.clip(colors_f32, 0.0, 1.0)
-            pcd.colors = o3d.utility.Vector3dVector(colors_vis.astype(np.float64))
-            return pcd
-
-        # 保存 raw 点云
-        if raw_pts is not None and raw_cols is not None and len(raw_pts) > 0:
-            pcd_raw = make_o3d_pcd(raw_pts, raw_cols)
-            o3d.io.write_point_cloud(str(self.dump_dir / f"{idx}_raw.ply"), pcd_raw, write_ascii=True)
-
-        # 保存 proc 点云（裁剪后，颜色反归一化用于可视化）
-        if proc_pts is not None and proc_cols is not None and len(proc_pts) > 0:
-            # 反归一化可视化
-            proc_cols_vis = np.clip(proc_cols, 0.0, 1.0)
-            pcd_proc = make_o3d_pcd(proc_pts, proc_cols_vis)
-            o3d.io.write_point_cloud(str(self.dump_dir / f"{idx}_proc.ply"), pcd_proc, write_ascii=True)
-
-        # 保存 final 稀疏坐标（将体素坐标还原为米）
-        if coords is not None and len(coords) > 0:
-            coords_xyz = coords.astype(np.float32) * float(self.voxel_size)
-            # 与 proc_pts 对齐（长度应一致）
-            final_cols = proc_cols if (proc_cols is not None and len(proc_cols) == len(coords_xyz)) else np.ones_like(coords_xyz)
-            final_cols_vis = np.clip(final_cols, 0.0, 1.0)
-            pcd_final = make_o3d_pcd(coords_xyz, final_cols_vis)
-            o3d.io.write_point_cloud(str(self.dump_dir / f"{idx}_final_sparse.ply"), pcd_final, write_ascii=True)
-
-        # 保存数值数据为 npz
-        np.savez_compressed(
-            str(self.dump_dir / f"{idx}_data.npz"),
-            raw_points=raw_pts,
-            raw_colors=raw_cols,
-            proc_points=proc_pts,
-            proc_colors=proc_cols,
-            final_coords_int=coords,
-            final_coords_xyz=(coords.astype(np.float32) * float(self.voxel_size)) if coords is not None else None,
-            cloud_to_policy=cloud,  # (N,6) = [x,y,z, r_norm,g_norm,b_norm]
-        )
     
     def unnormalize_action(self, action):
         """
@@ -623,9 +586,11 @@ class RISEInferenceRunner:
                  max_steps: int = 1000,
                  test_mode: bool = False,
                  frequency: float = 20.0,
-                 debug_image: bool = False):
+                 debug_image: bool = False,
+                 save_images: bool = False,
+                 save_dir: str = None):
         """
-        初始化ACT推理运行器
+        初始化RISE推理运行器
         
         Args:
             model_path: 模型路径
@@ -634,6 +599,9 @@ class RISEInferenceRunner:
             max_steps: 最大运行步数
             test_mode: 测试模式
             frequency: 推理频率 (Hz)
+            debug_image: 是否显示图像处理调试信息
+            save_images: 是否保存图像
+            save_dir: 保存目录
         """
         self.model_path = model_path
         self.config_path = config_path
@@ -642,10 +610,12 @@ class RISEInferenceRunner:
         self.test_mode = test_mode
         self.frequency = frequency
         self.debug_image = debug_image
+        self.save_images = save_images
+        self.save_dir = save_dir
         self.dt = 1.0 / frequency  # 时间间隔
         
         # 创建相机系统
-        self.camera_system = CameraSystem()
+        self.camera_system = CameraSystem(save_images=self.save_images, save_dir=self.save_dir)
         
         # 创建RISE策略
         self.policy = RISEPolicyWrapper(
@@ -852,6 +822,10 @@ def main():
                        help="推理频率 (Hz) - RISE模型推理较慢，建议5Hz")
     parser.add_argument("--debug_image", action="store_true", default=False,
                        help="显示图像处理调试信息")
+    parser.add_argument("--save_images", action="store_true", default=True,
+                       help="推理时保存相机图片")
+    parser.add_argument("--save_dir", type=str, default=None,
+                       help="保存图片的根目录（可选，默认 runs/inference_images/<timestamp>）")
     
     args = parser.parse_args()
     
@@ -889,7 +863,9 @@ def main():
             max_steps=args.max_steps,
             test_mode=args.test_mode,
             frequency=args.frequency,
-            debug_image=args.debug_image
+            debug_image=args.debug_image,
+            save_images=args.save_images,
+            save_dir=args.save_dir
         )
         
         # 执行推理
