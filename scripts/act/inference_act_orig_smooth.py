@@ -20,8 +20,8 @@ import yaml
 from collections import deque
 
 # 添加项目路径到sys.path，确保优先使用项目中的lerobot库
-project_dir = Path(__file__).parent.parent
-model_lerobot_path = project_dir / "model" / "lerobot" / "src"
+project_dir = Path(__file__).parent.parent.parent
+model_lerobot_path = project_dir / "model" / "lerobot_with_DINOv3_backbone-main" / "src"
 sys.path.insert(0, str(model_lerobot_path))
 sys.path.insert(0, str(project_dir))  # 添加项目根目录到路径
 
@@ -47,7 +47,7 @@ R3KIT_RS_AVAILABLE = True
 class ActionSmoother:
     """动作平滑器 - 检测突变并平滑动作"""
     
-    def __init__(self, mutation_threshold=0.1,history_size=10):
+    def __init__(self, mutation_threshold=0.04,history_size=10):
         """
         初始化动作平滑器
         
@@ -150,8 +150,8 @@ class ActionSmoother:
 # D415 相机配置（与采集脚本保持一致）
 FPS = 30
 D415_CAMERAS = {   
-    "cam4": "327322062498",  # 固定机位视角
-    "eih": "038522062288",   # eye-in-hand视角（需要根据实际序列号修改）
+    "cam_0": "327322062498",  # 固定机位视角
+    "cam_1": "104122063633",   # 下视相机
 }
 
 class CameraSystem:
@@ -159,7 +159,7 @@ class CameraSystem:
     
     def __init__(self):
         self.cameras = {}
-        self.camera_names = ["cam4", "eih"]  # 支持双视角
+        self.camera_names = ["cam_0", "cam_1"]  # 支持双视角
         self.use_realsense = True
         
         # 与采集脚本保持一致的流配置
@@ -247,17 +247,20 @@ class CameraSystem:
 class ACTPolicyWrapper:
     """ACT策略包装器 - 适配最新版本的lerobot库"""
     
-    def __init__(self, model_path, device="cpu", camera_system=None, debug_image=False,use_eih=True):
+    def __init__(self, model_path, device="cpu", camera_system=None, debug_image=False, use_dual_cam=True):
         self.device = torch.device(device)
         self.model_path = Path(model_path)
         self.camera_system = camera_system
         self.debug_image = debug_image
-        self.use_eih = use_eih
+        self.use_dual_cam = use_dual_cam
+        
         # 配置参数
         self.image_size = (224, 224)
-        self.camera_names = ["cam4"]  # 默认只有固定机位视角
-        if self.use_eih:
-            self.camera_names.append("eih")  # 如果需要eih，添加到相机列表
+        if self.use_dual_cam:
+            self.camera_names = ["cam_0", "cam_1"]  # 双视角模式
+        else:
+            self.camera_names = ["cam_0"]  # 单视角模式
+        
         self.joint_dim = 7  # 7个关节角度（弧度）  
         self.gripper_dim = 1  # 1个夹爪开合值  
         self.action_dim = self.joint_dim + self.gripper_dim  # 总共8维  
@@ -268,7 +271,10 @@ class ACTPolicyWrapper:
         
         print(f"ACT策略初始化完成: {model_path}")
         print(f"使用设备: {self.device}")
-        print(f"支持视角: 固定机位(cam4)" + (" + eye-in-hand(eih)" if self.use_eih else ""))
+        if self.use_dual_cam:
+            print(f"支持视角: 固定机位(cam_0) + 下视相机(cam_1)")
+        else:
+            print(f"支持视角: 固定机位(cam_0)")
         print(f"相机系统状态: {len(self.camera_system.cameras) if self.camera_system else 0} 个相机已初始化")
     
     def _load_policy(self):
@@ -297,48 +303,67 @@ class ACTPolicyWrapper:
         
         return policy
     
-    def preprocess_image(self, image, debug=False):
-        """预处理图像 - 与训练时保持一致：先裁剪成正方形，再缩放到目标尺寸"""
+    def preprocess_image(self, image, index, debug=False):
+        """预处理图像 - 适配DINOv3：确保尺寸能被16整除，双视角统一处理"""
         if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
+            # 保存numpy格式用于cam_1的padding操作
+            image_np = image
+            image_pil = Image.fromarray(image)
+        else:
+            image_pil = image
+            image_np = np.array(image)
         
         # 获取原始图像尺寸
-        width, height = image.size
+        width, height = image_pil.size
         if debug:
             print(f"原始图像尺寸: {width}x{height}")
+
+        if index not in (0, 1):
+            raise ValueError(f"unsupported index: {index}")
         
-        # 按照训练时的处理方式裁剪
-        if width == 640 and height == 480:
-            # 640*480尺寸：从特定位置裁剪到360*360
-            left = 200
-            right = 560
+        # 目标尺寸（确保能被16整除，DINOv3 patch_size=16）
+        target_size = (224, 224)
+        
+        if index == 0:
+            # cam_0（固定机位）：裁剪处理
+            left = 180
+            right = 540
             top = 0
             bottom = 360
             if debug:
-                print(f"640x480图片，裁剪区域: ({left}, {top}, {right}, {bottom})")
-        else:
-            # 其他尺寸：按比例裁剪成正方形
-            min_dim = min(width, height)
-            left = (width - min_dim) // 2
-            right = left + min_dim
-            top = (height - min_dim) // 2
-            bottom = top + min_dim
+                print(f"cam_0 裁剪区域: ({left}, {top}, {right}, {bottom})")
+            
+            # 裁剪
+            image_processed = image_pil.crop((left, top, right, bottom))
             if debug:
-                print(f"其他尺寸图片，裁剪成正方形: ({left}, {top}, {right}, {bottom})")
+                print(f"裁剪后尺寸: {image_processed.size}")
         
-        # 裁剪
-        image_cropped = image.crop((left, top, right, bottom))
-        if debug:
-            print(f"裁剪后尺寸: {image_cropped.size}")
-        
+        else:  # index == 1
+            # cam_1（下视相机）：扩张像素处理
+            if debug:
+                print(f"cam_1 扩张像素处理")
+            
+            # 使用cv2进行padding（上下各扩展80像素）
+            image_expanded = cv2.copyMakeBorder(
+                image_np,
+                80, 80, 0, 0,  # top, bottom, left, right
+                cv2.BORDER_CONSTANT,
+                value=[0, 0, 0]  # 黑色 (RGB格式)
+            )
+            if debug:
+                print(f"扩展后尺寸: {image_expanded.shape}")
+            
+            # 转换回PIL格式
+            image_processed = Image.fromarray(image_expanded)
+
         # 缩放到目标尺寸
-        image_resized = image_cropped.resize(self.image_size, Image.Resampling.LANCZOS)
+        image_resized = image_processed.resize(target_size, Image.Resampling.LANCZOS)
         if debug:
             print(f"缩放后尺寸: {image_resized.size}")
         
-        # 转换为tensor并归一化
+        # 转换为tensor并归一化到[0, 1]
         image_tensor = torch.from_numpy(np.array(image_resized)).permute(2, 0, 1).float()  # (3, H, W)
-        image_tensor = image_tensor / 255.0
+        image_tensor = image_tensor / 255.0  # 归一化到[0, 1]
         
         return image_tensor
     
@@ -363,35 +388,37 @@ class ACTPolicyWrapper:
         单步预测动作（使用 ACTPolicy.select_action）。
         返回: (8,) numpy 数组，前7维为关节(弧度)，第8维为夹爪(米)。
         """
-        # 预处理固定机位视角图像
-        if "cam4" in images:
-            color_img_tensor = self.preprocess_image(images["cam4"], debug=self.debug_image)
+        # 预处理固定机位视角图像 (cam_0)
+        if "cam_0" in images:
+            color_img_tensor = self.preprocess_image(images["cam_0"], debug=self.debug_image, index=0)
         else:
             # 随机图像回退
             fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            color_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
+            color_img_tensor = self.preprocess_image(fake, debug=self.debug_image, index=0)
             print("警告: 固定机位视角图像获取失败，使用模拟图像")
         
-        # 构建batch - 根据是否使用eih来决定输入格式
-        if self.use_eih:
-            # 预处理eye-in-hand视角图像
-            if "eih" in images:
-                eih_img_tensor = self.preprocess_image(images["eih"], debug=self.debug_image)
+        # 构建batch - 根据模式选择
+        # 注意：实际模型期望的键名是 "cam_0" 和 "cam_1"
+        if self.use_dual_cam:
+            # 双视角模式：预处理下视相机图像 (cam_1)
+            if "cam_1" in images:
+                eih_img_tensor = self.preprocess_image(images["cam_1"], debug=self.debug_image, index=1)
             else:
                 # 随机图像回退
                 fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-                eih_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
-                print("警告: eye-in-hand视角图像获取失败，使用模拟图像")
+                eih_img_tensor = self.preprocess_image(fake, debug=self.debug_image, index=1)
+                print("警告: 下视相机视角图像获取失败，使用模拟图像")
             
             batch = {
-                "observation.images.cam": color_img_tensor.unsqueeze(0).to(self.device),
-                "observation.images.eih": eih_img_tensor.unsqueeze(0).to(self.device),
+                "observation.images.cam_0": color_img_tensor.unsqueeze(0).to(self.device),
+                "observation.images.cam_1": eih_img_tensor.unsqueeze(0).to(self.device),
                 "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
             }
         else:
-            # 只使用固定机位视角
+            # 单视角模式：只使用cam_0，cam_1使用相同的图像
             batch = {
-                "observation.images.cam": color_img_tensor.unsqueeze(0).to(self.device),
+                "observation.images.cam_0": color_img_tensor.unsqueeze(0).to(self.device),
+                "observation.images.cam_1": color_img_tensor.unsqueeze(0).to(self.device),  # 使用相同的图像
                 "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
             }
         
@@ -464,7 +491,7 @@ class ACTInferenceRunner:
                  test_mode: bool = False,
                  frequency: float = 20.0,
                  debug_image: bool = False,
-                 use_eih: bool = True):
+                 use_dual_cam: bool = True):
         """
         初始化ACT推理运行器
         
@@ -475,6 +502,8 @@ class ACTInferenceRunner:
             max_steps: 最大运行步数
             test_mode: 测试模式
             frequency: 推理频率 (Hz)
+            debug_image: 图像调试模式
+            use_dual_cam: 是否使用双视角模式
         """
         self.model_path = model_path
         self.config_path = config_path
@@ -483,7 +512,7 @@ class ACTInferenceRunner:
         self.test_mode = test_mode
         self.frequency = frequency
         self.debug_image = debug_image
-        self.use_eih = use_eih
+        self.use_dual_cam = use_dual_cam
         self.dt = 1.0 / frequency  # 时间间隔
         
         # 创建相机系统
@@ -495,7 +524,7 @@ class ACTInferenceRunner:
             device=device,
             camera_system=self.camera_system,
             debug_image=self.debug_image,
-            use_eih=self.use_eih
+            use_dual_cam=self.use_dual_cam
         )
         
         # 创建动作平滑器
@@ -507,7 +536,10 @@ class ACTInferenceRunner:
         print(f"设备: {device}")
         print(f"测试模式: {test_mode}")
         print(f"推理频率: {frequency} Hz")
-        print(f"使用eih: {self.use_eih}")
+        if self.use_dual_cam:
+            print(f"使用双视角: cam_0 + cam_1")
+        else:
+            print(f"使用单视角: cam_0")
         
         # 检查相机状态
         self.policy.check_camera_status()
@@ -680,7 +712,7 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="基于相机和ACT模型的实时推理脚本 - 更新版本")
     parser.add_argument("--model_path", type=str, 
-                       default="/home/robotflow/Downloads/060000/pretrained_model",
+                       default="/home/robotflow/Downloads/new_model/replay_act_2cam_orgact/checkpoints/060000/pretrained_model",
                        help="训练好的模型路径")
     parser.add_argument("--device", type=str, default="cuda",
                        help="计算设备 (cpu/cuda)")
@@ -695,10 +727,27 @@ def main():
                        help="推理频率 (Hz) - 针对130ms推理时间优化")
     parser.add_argument("--debug_image", action="store_true", default=False,
                        help="显示图像处理调试信息")
-    parser.add_argument("--use_eih", action="store_true", default=False,  # 新增
-                       help="使用eye-in-hand视角作为输入")
+    parser.add_argument("--use_dual_cam", action="store_true", default=True,
+                       help="使用双视角模式 (cam_0 + cam_1)")
+    parser.add_argument("--use_single_cam", action="store_true", default=False,
+                       help="使用单视角模式 (仅cam_0，cam_1使用相同图像)")
     args = parser.parse_args()
     
+    # 处理相机模式参数
+    # 如果显式指定了use_single_cam，则使用单视角模式
+    # 如果显式指定了use_dual_cam，则使用双视角模式
+    # 如果都没有指定，默认使用双视角模式
+    if args.use_single_cam:
+        use_dual_cam = False
+        print("使用单视角模式（仅cam_0，cam_1使用相同图像）")
+    elif args.use_dual_cam:
+        use_dual_cam = True
+        print("使用双视角模式（cam_0 + cam_1）")
+    else:
+        # 默认使用双视角模式
+        use_dual_cam = True
+        print("默认使用双视角模式（cam_0 + cam_1）")
+        
     # 检查配置文件
     if not os.path.exists(args.config_path):
         print(f"错误: 配置文件不存在: {args.config_path}")
@@ -719,7 +768,7 @@ def main():
             test_mode=args.test_mode,
             frequency=args.frequency,
             debug_image=args.debug_image,
-            use_eih=args.use_eih
+            use_dual_cam=use_dual_cam
         )
         
         # 执行推理

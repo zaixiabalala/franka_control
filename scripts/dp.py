@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-基于相机和ACT模型的实时推理脚本 - DINOv3双模式版本
-适配最新版本的lerobot库，支持DINOv3视觉backbone和双模式相机输入
+基于相机和Mask DP模型的实时推理脚本 - DINOv3双模式版本
+适配Mask_DP策略，支持DINOv3视觉backbone和双模式相机输入
 
-主要更新：
-1. 支持DINOv3视觉backbone (dinov3_vits16, dinov3_vitb16, dinov3_vitl16)
-2. 图像预处理适配DINOv3尺寸要求（224x224）
-3. 支持DINO模型目录配置
-4. 支持双模式相机输入：
+主要特性：
+1. 支持Mask DP (Masked Diffusion Policy) 扩散模型
+2. 支持DINOv3视觉backbone (dinov3_vits16, dinov3_vitb16, dinov3_vitl16)
+3. 图像预处理适配DINOv3尺寸要求（224x224）
+4. 支持DINO模型目录配置
+5. 支持双模式相机输入：
    - 双视角模式：cam_0 (固定机位) + cam_1 (下视相机)
    - 单视角模式：仅 cam_0 (固定机位)，cam_1使用相同图像
-5. 兼容原有的ResNet模型
+6. Action Queue机制（chunk_size预测，n_action_steps执行）
 
 使用方法：
 # 双视角模式（默认）
-python inference_dino.py --model_path /path/to/dinov3_model --vision_backbone dinov3_vitb16
+python dp.py --model_path /path/to/mask_dp_model --vision_backbone dinov3_vitb16
 
 # 单视角模式
-python inference_dino.py --model_path /path/to/dinov3_model --use_single_cam
+python dp.py --model_path /path/to/mask_dp_model --use_single_cam
 
 # 显式指定双视角模式
-python inference_dino.py --model_path /path/to/dinov3_model --use_dual_cam
+python dp.py --model_path /path/to/mask_dp_model --use_dual_cam
 
 注意：需要确保DINOv3模型目录存在，或者模型配置中包含正确的dino_model_dir
 """
@@ -45,18 +46,18 @@ import numpy as np
 import os
 
 # 添加项目路径到sys.path，确保优先使用项目中的lerobot库
-# 注意：脚本在scripts/act/目录下，所以需要向上两级到达项目根目录
-project_dir = Path(__file__).parent.parent.parent
-# 使用新的DINOv3版本的lerobot库
-model_lerobot_path = project_dir / "model" / "lerobot_with_DINOv3_backbone-main" / "src"
+# 注意：脚本在scripts/目录下，所以需要向上一级到达项目根目录
+project_dir = Path(__file__).parent.parent
+# 使用Mask DP版本的lerobot库
+model_lerobot_path = project_dir / "model" / "Mask_DP-main" / "lerobot_with_mask_dp" / "src"
 sys.path.insert(0, str(model_lerobot_path))
 sys.path.insert(0, str(project_dir))  # 添加项目根目录到路径
 
 # 在添加路径后导入项目模块
 from common.gripper_util import convert_gripper_width_to_encoder
 
-# 导入最新版本的lerobot库（支持DINOv3）
-from lerobot.policies.act.modeling_act import ACTPolicy
+# 导入Mask DP库（支持DINOv3）
+from lerobot.policies.mask_dp.modeling_mask_dp import MaskDPPolicy
 from lerobot.constants import OBS_IMAGES, ACTION, OBS_STATE
 
 # 导入PolicyInterface
@@ -271,8 +272,8 @@ class CameraSystem:
                 print(f"关闭 {cam_name} 失败: {e}")
 
 
-class ACTPolicyWrapper:
-    """ACT策略包装器 - 适配最新版本的lerobot库（支持DINOv3）"""
+class MaskDPPolicyWrapper:
+    """Mask DP策略包装器 - 适配Mask_DP库（支持DINOv3 + Diffusion）"""
     
     def __init__(self, model_path, device="cpu", camera_system=None, debug_image=False, 
                  dino_model_dir="dinov3-vits", vision_backbone="dinov3_vitb16", use_dual_cam=True):
@@ -293,15 +294,19 @@ class ACTPolicyWrapper:
         self.joint_dim = 7  # 7个关节角度（弧度）  
         self.gripper_dim = 1  # 1个夹爪开合值  
         self.action_dim = self.joint_dim + self.gripper_dim  # 总共8维  
-        self.chunk_size = 100  # ACT模型的chunk大小
         
         # 加载模型
         self.policy = self._load_policy()
         
-        print(f"ACT策略初始化完成: {model_path}")
+        # 从配置中获取chunk_size和n_action_steps
+        self.chunk_size = self.policy.config.chunk_size
+        self.n_action_steps = self.policy.config.n_action_steps
+        
+        print(f"Mask DP策略初始化完成: {model_path}")
         print(f"使用设备: {self.device}")
         print(f"视觉backbone: {self.vision_backbone}")
         print(f"DINO模型目录: {self.dino_model_dir}")
+        print(f"Chunk size: {self.chunk_size}, Action steps: {self.n_action_steps}")
         if self.use_dual_cam:
             print(f"支持视角: 固定机位(cam_0) + 下视相机(cam_1)")
         else:
@@ -309,12 +314,12 @@ class ACTPolicyWrapper:
         print(f"相机系统状态: {len(self.camera_system.cameras) if self.camera_system else 0} 个相机已初始化")
     
     def _load_policy(self):
-        """加载训练好的策略模型（支持DINOv3）"""
+        """加载训练好的Mask DP策略模型（支持DINOv3）"""
         if not self.model_path.exists():
             raise FileNotFoundError(f"模型路径不存在: {self.model_path}")
         
         # 在加载模型之前，修改配置文件以设置dino_model_dir
-        # 这样做是为了确保ACTPolicy.from_pretrained能正确加载DINOv3模型
+        # 这样做是为了确保MaskDPPolicy.from_pretrained能正确加载DINOv3模型
         config_path = self.model_path / "config.json"
         if config_path.exists() and self.dino_model_dir:
             try:
@@ -332,29 +337,30 @@ class ACTPolicyWrapper:
             except Exception as e:
                 print(f"警告: 更新配置文件失败: {e}")
         
-        # 使用from_pretrained加载模型(推荐方式)
-        policy = ACTPolicy.from_pretrained(str(self.model_path))
+        # 使用from_pretrained加载Mask DP模型(推荐方式)
+        policy = MaskDPPolicy.from_pretrained(str(self.model_path))
         
         # 移动到指定设备
         policy.to(self.device)
         
         # 设置评估模式（from_pretrained已自动调用，但显式调用更明确）
         policy.eval()
-        
-        # 设置执行部署
-        policy.config.n_action_steps = 50
 
         # 打印配置信息
         print(f"模型加载成功:")
-        print(f" 策略类型: {policy.config.type}")
+        print(f" 策略类型: {policy.name}")  # name 属性在 policy 上，不是 config 上
         print(f" 视觉backbone: {policy.config.vision_backbone}")
         print(f" 设备: {next(policy.parameters()).device}")
-        print(f" 时间集成系数: {policy.config.temporal_ensemble_coeff}")
         print(f" 动作步数: {policy.config.n_action_steps}")
         print(f" 块大小: {policy.config.chunk_size}")
         print(f" 冻结backbone: {policy.config.freeze_backbone}")
+        print(f" 使用Mask: {policy.config.use_mask}")
+        print(f" 推理步数: {policy.config.num_inference_steps}")
         if hasattr(policy.config, 'dino_model_dir'):
             print(f" DINO模型目录: {policy.config.dino_model_dir}")
+        
+        # 重置策略状态（清空action queue）
+        policy.reset()
         
         return policy
     
@@ -440,7 +446,8 @@ class ACTPolicyWrapper:
     
     def predict_single_action(self, images, current_state):
         """
-        单步预测动作（使用 ACTPolicy.select_action）。
+        单步预测动作（使用 MaskDPPolicy.select_action）。
+        Mask DP内部管理action queue，自动处理chunk预测和单步返回。
         返回: (8,) numpy 数组，前7维为关节(弧度)，第8维为夹爪(米)。
         """
         # 预处理固定机位视角图像 (cam_0)
@@ -453,7 +460,7 @@ class ACTPolicyWrapper:
             print("警告: 固定机位视角图像获取失败，使用模拟图像")
         
         # 构建batch - 根据模式选择
-        # 注意：实际模型期望的键名是 "cam_0" 和 "cam_1"
+        # 注意：实际模型期望的键名是 "observation.images.cam_0" 和 "observation.images.cam_1"
         if self.use_dual_cam:
             # 双视角模式：预处理下视相机图像 (cam_1)
             if "cam_1" in images:
@@ -479,6 +486,10 @@ class ACTPolicyWrapper:
         
         with torch.no_grad():
             # 使用select_action进行单步预测
+            # Mask DP的select_action会内部管理action queue：
+            # - 当queue为空时，预测一个chunk (chunk_size个actions)
+            # - 保留前n_action_steps个actions放入queue
+            # - 每次调用从queue中pop一个action返回
             action = self.policy.select_action(batch)  # (1, action_dim)，已反归一化
             action = action.squeeze(0).detach().cpu().numpy()  # (8,)
         
@@ -535,8 +546,8 @@ class ACTPolicyWrapper:
         return len(self.camera_system.cameras) > 0
 
 
-class ACTInferenceRunner:
-    """ACT推理运行器 - 使用与replay_trajectory相同的接口形式"""
+class MaskDPInferenceRunner:
+    """Mask DP推理运行器 - 使用与replay_trajectory相同的接口形式"""
     
     def __init__(self, 
                  model_path: str,
@@ -551,7 +562,7 @@ class ACTInferenceRunner:
                  use_dual_cam: bool = True,
                  enable_action_smoother: bool = False):
         """
-        初始化ACT推理运行器
+        初始化Mask DP推理运行器
         
         Args:
             model_path: 模型路径
@@ -582,8 +593,8 @@ class ACTInferenceRunner:
         # 创建相机系统
         self.camera_system = CameraSystem()
         
-        # 创建ACT策略
-        self.policy = ACTPolicyWrapper(
+        # 创建Mask DP策略
+        self.policy = MaskDPPolicyWrapper(
             model_path=model_path,
             device=device,
             camera_system=self.camera_system,
@@ -601,7 +612,7 @@ class ACTInferenceRunner:
             self.action_smoother = None
             print(f"动作平滑器已禁用")
         
-        print(f"ACT推理运行器初始化完成")
+        print(f"Mask DP推理运行器初始化完成")
         print(f"模型路径: {model_path}")
         print(f"配置文件: {config_path}")
         print(f"设备: {device}")
@@ -787,21 +798,21 @@ class ACTInferenceRunner:
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="基于相机和ACT模型的实时推理脚本 - 更新版本")
+    parser = argparse.ArgumentParser(description="基于相机和Mask DP模型的实时推理脚本 - Diffusion Policy版本")
     parser.add_argument("--model_path", type=str, 
-                       default="/home/robotflow/Downloads/act_dumbbell_100_1cam_orgcolor_dino_lora_1015/checkpoints/060000/pretrained_model",
-                       help="训练好的模型路径")
+                       default="/home/robotflow/Downloads/dp_1cam_gs50_dino_lora/pretrained_model",
+                       help="训练好的Mask DP模型路径")
     parser.add_argument("--device", type=str, default="cuda",
                        help="计算设备 (cpu/cuda)")
     parser.add_argument("--config_path", type=str,
-                       default="/home/robotflow/my_code/other_codes/franka_control_final/config/robot_config.yaml",
+                       default="/home/robotflow/my_code/other_codes/franka_control/config/robot_config.yaml",
                        help="机器人配置文件路径")
     parser.add_argument("--max_steps", type=int, default=1000,
                        help="最大运行步数")
     parser.add_argument("--test_mode", action="store_true", default=False,
                        help="测试模式（不连接真实机器人）")
     parser.add_argument("--frequency", type=float, default=10.0,
-                       help="推理频率 (Hz) - 针对130ms推理时间优化")
+                       help="推理频率 (Hz) - Mask DP扩散模型推理时间较长")
     parser.add_argument("--debug_image", action="store_true", default=False,
                        help="显示图像处理调试信息")
     parser.add_argument("--dino_model_dir", type=str, default="/home/robotflow/Downloads/dinov3-vits/dinov3-vitb16-pretrain-lvd1689m",
@@ -812,7 +823,7 @@ def main():
                        help="使用双视角模式 (cam_0 + cam_1)")
     parser.add_argument("--use_single_cam", action="store_true", default=True,
                        help="使用单视角模式 (仅cam_0，cam_1使用相同图像)")
-    parser.add_argument("--enable_action_smoother", action="store_true", default=True,
+    parser.add_argument("--enable_action_smoother", action="store_true", default=False,
                        help="启用动作平滑器来检测和平滑突变动作")
     args = parser.parse_args()
     
@@ -841,9 +852,9 @@ def main():
         print(f"错误: 模型路径不存在: {args.model_path}")
         return 1
     
-    # 创建并运行ACT推理运行器
+    # 创建并运行Mask DP推理运行器
     try:
-        runner = ACTInferenceRunner(
+        runner = MaskDPInferenceRunner(
             model_path=args.model_path,
             config_path=args.config_path,
             device=args.device,
