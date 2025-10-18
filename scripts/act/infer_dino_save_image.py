@@ -1,7 +1,28 @@
 #!/usr/bin/env python3
 """
-基于相机和ACT模型的实时推理脚本 - 更新版本
-适配最新版本的lerobot库
+基于相机和ACT模型的实时推理脚本 - DINOv3双模式版本
+适配最新版本的lerobot库，支持DINOv3视觉backbone和双模式相机输入
+
+主要更新：
+1. 支持DINOv3视觉backbone (dinov3_vits16, dinov3_vitb16, dinov3_vitl16)
+2. 图像预处理适配DINOv3尺寸要求（224x224）
+3. 支持DINO模型目录配置
+4. 支持双模式相机输入：
+   - 双视角模式：cam_0 (固定机位) + cam_1 (下视相机)
+   - 单视角模式：仅 cam_0 (固定机位)，cam_1使用相同图像
+5. 兼容原有的ResNet模型
+
+使用方法：
+# 双视角模式（默认）
+python inference_dino.py --model_path /path/to/dinov3_model --vision_backbone dinov3_vitb16
+
+# 单视角模式
+python inference_dino.py --model_path /path/to/dinov3_model --use_single_cam
+
+# 显式指定双视角模式
+python inference_dino.py --model_path /path/to/dinov3_model --use_dual_cam
+
+注意：需要确保DINOv3模型目录存在，或者模型配置中包含正确的dino_model_dir
 """
 
 import os
@@ -19,16 +40,23 @@ import sys
 import yaml
 from collections import deque
 
+import json
+import numpy as np
+import os
+from datetime import datetime
+
 # 添加项目路径到sys.path，确保优先使用项目中的lerobot库
-project_dir = Path(__file__).parent.parent
-model_lerobot_path = project_dir / "model" / "lerobot" / "src"
+# 注意：脚本在scripts/act/目录下，所以需要向上两级到达项目根目录
+project_dir = Path(__file__).parent.parent.parent
+# 使用新的DINOv3版本的lerobot库
+model_lerobot_path = project_dir / "model" / "lerobot_with_DINOv3_backbone-main" / "src"
 sys.path.insert(0, str(model_lerobot_path))
 sys.path.insert(0, str(project_dir))  # 添加项目根目录到路径
 
 # 在添加路径后导入项目模块
 from common.gripper_util import convert_gripper_width_to_encoder
 
-# 导入最新版本的lerobot库
+# 导入最新版本的lerobot库（支持DINOv3）
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.constants import OBS_IMAGES, ACTION, OBS_STATE
 
@@ -47,7 +75,7 @@ R3KIT_RS_AVAILABLE = True
 class ActionSmoother:
     """动作平滑器 - 检测突变并平滑动作"""
     
-    def __init__(self, mutation_threshold=0.04,history_size=10):
+    def __init__(self, mutation_threshold=0.1,history_size=10):
         """
         初始化动作平滑器
         
@@ -245,18 +273,28 @@ class CameraSystem:
 
 
 class ACTPolicyWrapper:
-    """ACT策略包装器 - 适配最新版本的lerobot库"""
+    """ACT策略包装器 - 适配最新版本的lerobot库（支持DINOv3）"""
     
-    def __init__(self, model_path, device="cpu", camera_system=None, debug_image=False,use_eih=True):
+    def __init__(self, model_path, device="cpu", camera_system=None, debug_image=False, 
+                 dino_model_dir="dinov3-vits", vision_backbone="dinov3_vitb16", use_dual_cam=True,
+                 save_images=False, save_dir=None):
         self.device = torch.device(device)
         self.model_path = Path(model_path)
         self.camera_system = camera_system
         self.debug_image = debug_image
-        self.use_eih = use_eih
+        self.dino_model_dir = dino_model_dir
+        self.vision_backbone = vision_backbone
+        self.use_dual_cam = use_dual_cam
+        self.save_images = save_images
+        self.save_dir = save_dir
+        self.inference_step = 0  # 用于记录推理步数，用于文件命名
+        
         # 配置参数
-        self.image_size = (224, 224)
-        self.camera_names = ["cam_0","cam_1"]  # 默认只有固定机位视角
-
+        self.image_size = (224, 224)  # DINOv3推荐尺寸
+        if self.use_dual_cam:
+            self.camera_names = ["cam_0", "cam_1"]  # 双视角模式
+        else:
+            self.camera_names = ["cam_0"]  # 单视角模式
         self.joint_dim = 7  # 7个关节角度（弧度）  
         self.gripper_dim = 1  # 1个夹爪开合值  
         self.action_dim = self.joint_dim + self.gripper_dim  # 总共8维  
@@ -267,20 +305,46 @@ class ACTPolicyWrapper:
         
         print(f"ACT策略初始化完成: {model_path}")
         print(f"使用设备: {self.device}")
+        print(f"视觉backbone: {self.vision_backbone}")
+        print(f"DINO模型目录: {self.dino_model_dir}")
+        if self.use_dual_cam:
+            print(f"支持视角: 固定机位(cam_0) + 下视相机(cam_1)")
+        else:
+            print(f"支持视角: 固定机位(cam_0)")
         print(f"相机系统状态: {len(self.camera_system.cameras) if self.camera_system else 0} 个相机已初始化")
     
     def _load_policy(self):
-        """加载训练好的策略模型"""
+        """加载训练好的策略模型（支持DINOv3）"""
         if not self.model_path.exists():
             raise FileNotFoundError(f"模型路径不存在: {self.model_path}")
         
+        # 在加载模型之前，修改配置文件以设置dino_model_dir
+        # 这样做是为了确保ACTPolicy.from_pretrained能正确加载DINOv3模型
+        config_path = self.model_path / "config.json"
+        if config_path.exists() and self.dino_model_dir:
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                
+                # 更新dino_model_dir
+                config["dino_model_dir"] = self.dino_model_dir
+                
+                # 写回配置文件
+                with open(config_path, 'w') as f:
+                    json.dump(config, f, indent=2)
+                
+                print(f"已更新配置: dino_model_dir = {self.dino_model_dir}")
+            except Exception as e:
+                print(f"警告: 更新配置文件失败: {e}")
+        
         # 使用from_pretrained加载模型(推荐方式)
-        policy = ACTPolicy.from_pretrained(
-            pretrained_name_or_path=str(self.model_path)
-        )
+        policy = ACTPolicy.from_pretrained(str(self.model_path))
         
         # 移动到指定设备
         policy.to(self.device)
+        
+        # 设置评估模式（from_pretrained已自动调用，但显式调用更明确）
+        policy.eval()
         
         # 设置执行部署
         policy.config.n_action_steps = 50
@@ -288,15 +352,19 @@ class ACTPolicyWrapper:
         # 打印配置信息
         print(f"模型加载成功:")
         print(f" 策略类型: {policy.config.type}")
+        print(f" 视觉backbone: {policy.config.vision_backbone}")
         print(f" 设备: {next(policy.parameters()).device}")
         print(f" 时间集成系数: {policy.config.temporal_ensemble_coeff}")
         print(f" 动作步数: {policy.config.n_action_steps}")
         print(f" 块大小: {policy.config.chunk_size}")
+        print(f" 冻结backbone: {policy.config.freeze_backbone}")
+        if hasattr(policy.config, 'dino_model_dir'):
+            print(f" DINO模型目录: {policy.config.dino_model_dir}")
         
         return policy
     
-    def preprocess_image(self, image, index, debug=False):
-        """预处理图像 - 与训练时保持一致：先裁剪成正方形，再缩放到目标尺寸"""
+    def preprocess_image(self, image, index, debug=False, cam_name=None):
+        """预处理图像 - 适配DINOv3：确保尺寸能被16整除，双视角统一处理"""
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
         
@@ -304,53 +372,38 @@ class ACTPolicyWrapper:
         width, height = image.size
         if debug:
             print(f"原始图像尺寸: {width}x{height}")
-        
 
         if index not in (0, 1):
             raise ValueError(f"unsupported index: {index}")
-        # 按照训练时的处理方式裁剪
-        if index==0:
-            # 640*480尺寸：从特定位置裁剪到360*360
-            left = 180
-            right = 540
-            top = 0
-            bottom = 360
-            if debug:
-                print(f"640x480图片，裁剪区域: ({left}, {top}, {right}, {bottom})")
         
-            # 裁剪
-            image_cropped = image.crop((left, top, right, bottom))
-            if debug:
-                print(f"裁剪后尺寸: {image_cropped.size}")
-
-            # 缩放到目标尺寸
-            image_resized = image_cropped.resize(self.image_size, Image.Resampling.LANCZOS)
-            if debug:
-                print(f"缩放后尺寸: {image_resized.size}")
-            
-        elif index==1:
-            # 上下各拓展80像素纯黑色边框
-            # 将PIL图片转为尺寸信息
-            padded_height = height + 160
-            padded_width = width
-            # 创建纯黑背景
-            from PIL import Image as _ImageAlias  # 避免与上方Image命名混淆风险
-            black_bg = _ImageAlias.new('RGB', (padded_width, padded_height), (0, 0, 0))
-            # 将原图粘贴到黑色背景中间（上下各留80像素）
-            black_bg.paste(image, (0, 80))
-            # 作为裁剪结果参与后续缩放
-            image_cropped = black_bg
-            if debug:
-                print(f"index==1，已上下各拓展80像素黑边: {image_cropped.size}")
-
-            # 缩放到目标尺寸
-            image_resized = image_cropped.resize(self.image_size, Image.Resampling.LANCZOS)
-            if debug:
-                print(f"缩放后尺寸: {image_resized.size}")
+        # 两个视角都使用相同的裁剪方式：从特定位置裁剪到360*360
+        left = 180
+        right = 540
+        top = 0
+        bottom = 360
+        if debug:
+            print(f"cam_{index} 640x480图片，裁剪区域: ({left}, {top}, {right}, {bottom})")
         
-        # 转换为tensor并归一化
+        # 裁剪
+        image_cropped = image.crop((left, top, right, bottom))
+        if debug:
+            print(f"裁剪后尺寸: {image_cropped.size}")
+
+        # 缩放到目标尺寸（确保能被16整除，DINOv3 patch_size=16）
+        target_size = (224, 224)  # 224能被16整除
+        image_resized = image_cropped.resize(target_size, Image.Resampling.LANCZOS)
+        if debug:
+            print(f"缩放后尺寸: {image_resized.size}")
+        
+        # 保存预处理后的图像（如果启用）
+        if self.save_images and self.save_dir is not None and cam_name is not None:
+            # 保存到 processed_images/cam_0/ 或 processed_images/cam_1/
+            save_path = self.save_dir / "processed_images" / cam_name / f"step_{self.inference_step:04d}.jpg"
+            image_resized.save(save_path)
+        
+        # 转换为tensor并归一化到[0, 1]
         image_tensor = torch.from_numpy(np.array(image_resized)).permute(2, 0, 1).float()  # (3, H, W)
-        image_tensor = image_tensor / 255.0
+        image_tensor = image_tensor / 255.0  # 归一化到[0, 1]
         
         return image_tensor
     
@@ -375,35 +428,59 @@ class ACTPolicyWrapper:
         单步预测动作（使用 ACTPolicy.select_action）。
         返回: (8,) numpy 数组，前7维为关节(弧度)，第8维为夹爪(米)。
         """
-        # 预处理固定机位视角图像
+        # 保存原始图像（如果启用）
+        if self.save_images and self.save_dir is not None:
+            for cam_name, img in images.items():
+                if img is not None:
+                    # 保存到 raw_images/cam_0/ 或 raw_images/cam_1/
+                    save_path = self.save_dir / "raw_images" / cam_name / f"step_{self.inference_step:04d}.jpg"
+                    # 如果是numpy数组，转换为PIL Image
+                    if isinstance(img, np.ndarray):
+                        Image.fromarray(img).save(save_path)
+                    else:
+                        img.save(save_path)
+        
+        # 预处理固定机位视角图像 (cam_0)
         if "cam_0" in images:
-            color_img_tensor = self.preprocess_image(images["cam_0"], debug=self.debug_image,index = 0)
+            color_img_tensor = self.preprocess_image(images["cam_0"], debug=self.debug_image, index=0, cam_name="cam_0")
         else:
             # 随机图像回退
             fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            color_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
+            color_img_tensor = self.preprocess_image(fake, debug=self.debug_image, index=0, cam_name="cam_0")
             print("警告: 固定机位视角图像获取失败，使用模拟图像")
         
-        # 构建batch - 根据是否使用eih来决定输入格式
-
-        if "cam_1" in images:
-            eih_img_tensor = self.preprocess_image(images["cam_1"], debug=self.debug_image,index = 1)
+        # 构建batch - 根据模式选择
+        # 注意：实际模型期望的键名是 "cam_0" 和 "cam_1"
+        if self.use_dual_cam:
+            # 双视角模式：预处理下视相机图像 (cam_1)
+            if "cam_1" in images:
+                eih_img_tensor = self.preprocess_image(images["cam_1"], debug=self.debug_image, index=1, cam_name="cam_1")
+            else:
+                # 随机图像回退
+                fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+                eih_img_tensor = self.preprocess_image(fake, debug=self.debug_image, index=1, cam_name="cam_1")
+                print("警告: 下视相机视角图像获取失败，使用模拟图像")
+            
+            batch = {
+                "observation.images.cam_0": color_img_tensor.unsqueeze(0).to(self.device),
+                "observation.images.cam_1": eih_img_tensor.unsqueeze(0).to(self.device),
+                "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
+            }
         else:
-            # 随机图像回退
-            fake = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            eih_img_tensor = self.preprocess_image(fake, debug=self.debug_image)
-            print("警告: 下视相机视角图像获取失败，使用模拟图像")
-        
-        batch = {
-            "observation.images.cam_0": color_img_tensor.unsqueeze(0).to(self.device),
-            "observation.images.cam_1": eih_img_tensor.unsqueeze(0).to(self.device),
-            "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
-        }
+            # 单视角模式：只使用cam_0，cam_1使用相同的图像
+            batch = {
+                "observation.images.cam_0": color_img_tensor.unsqueeze(0).to(self.device),
+                "observation.images.cam_1": color_img_tensor.unsqueeze(0).to(self.device),  # 使用相同的图像
+                "observation.state": torch.tensor(current_state, dtype=torch.float32).unsqueeze(0).to(self.device),
+            }
         
         with torch.no_grad():
             # 使用select_action进行单步预测
             action = self.policy.select_action(batch)  # (1, action_dim)，已反归一化
             action = action.squeeze(0).detach().cpu().numpy()  # (8,)
+        
+        # 增加推理步数计数器
+        self.inference_step += 1
         
         # 直接返回模型输出，所有单位都是弧度（前7维）和米（第8维）
         return action
@@ -469,7 +546,11 @@ class ACTInferenceRunner:
                  test_mode: bool = False,
                  frequency: float = 20.0,
                  debug_image: bool = False,
-                 use_eih: bool = True):
+                 dino_model_dir: str = "dinov3-vits",
+                 vision_backbone: str = "dinov3_vitb16",
+                 use_dual_cam: bool = True,
+                 enable_action_smoother: bool = False,
+                 save_images: bool = False):
         """
         初始化ACT推理运行器
         
@@ -480,6 +561,12 @@ class ACTInferenceRunner:
             max_steps: 最大运行步数
             test_mode: 测试模式
             frequency: 推理频率 (Hz)
+            debug_image: 图像调试模式
+            dino_model_dir: DINO模型目录
+            vision_backbone: 视觉backbone类型
+            use_dual_cam: 是否使用双视角模式
+            enable_action_smoother: 是否启用动作平滑器
+            save_images: 是否保存推理过程中的图像
         """
         self.model_path = model_path
         self.config_path = config_path
@@ -488,8 +575,32 @@ class ACTInferenceRunner:
         self.test_mode = test_mode
         self.frequency = frequency
         self.debug_image = debug_image
-        self.use_eih = use_eih
+        self.dino_model_dir = dino_model_dir
+        self.vision_backbone = vision_backbone
+        self.use_dual_cam = use_dual_cam
+        self.enable_action_smoother = enable_action_smoother
+        self.save_images = save_images
         self.dt = 1.0 / frequency  # 时间间隔
+        
+        # 创建保存目录（如果启用图像保存）
+        self.save_dir = None
+        if self.save_images:
+            # 获取项目根目录
+            project_root = Path(__file__).parent.parent.parent
+            infer_save_root = project_root / "infer_save"
+            infer_save_root.mkdir(parents=True, exist_ok=True)
+            
+            # 创建带时间戳的文件夹
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.save_dir = infer_save_root / f"inference_{timestamp}"
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 创建子文件夹：raw_images和processed_images各自包含cam_0和cam_1
+            for image_type in ["raw_images", "processed_images"]:
+                for cam_name in ["cam_0", "cam_1"]:
+                    (self.save_dir / image_type / cam_name).mkdir(parents=True, exist_ok=True)
+            
+            print(f"图像保存已启用，保存目录: {self.save_dir}")
         
         # 创建相机系统
         self.camera_system = CameraSystem()
@@ -500,11 +611,20 @@ class ACTInferenceRunner:
             device=device,
             camera_system=self.camera_system,
             debug_image=self.debug_image,
-            use_eih=self.use_eih
+            dino_model_dir=self.dino_model_dir,
+            vision_backbone=self.vision_backbone,
+            use_dual_cam=self.use_dual_cam,
+            save_images=self.save_images,
+            save_dir=self.save_dir
         )
         
-        # 创建动作平滑器
-        self.action_smoother = ActionSmoother(mutation_threshold=0.01,history_size=10)
+        # 创建动作平滑器（可选）
+        if self.enable_action_smoother:
+            self.action_smoother = ActionSmoother(mutation_threshold=0.01, history_size=10)
+            print(f"动作平滑器已启用（阈值: 0.01 rad）")
+        else:
+            self.action_smoother = None
+            print(f"动作平滑器已禁用")
         
         print(f"ACT推理运行器初始化完成")
         print(f"模型路径: {model_path}")
@@ -512,7 +632,12 @@ class ACTInferenceRunner:
         print(f"设备: {device}")
         print(f"测试模式: {test_mode}")
         print(f"推理频率: {frequency} Hz")
-        print(f"使用eih: {self.use_eih}")
+        if self.use_dual_cam:
+            print(f"使用双视角: cam_0 + cam_1")
+        else:
+            print(f"使用单视角: cam_0")
+        print(f"DINO模型目录: {self.dino_model_dir}")
+        print(f"视觉backbone: {self.vision_backbone}")
         
         # 检查相机状态
         self.policy.check_camera_status()
@@ -638,8 +763,11 @@ class ACTInferenceRunner:
                         print(f"⚠️  使用随机扰动动作，等待有效推理: 推理时间={inference_time:.3f}s")
                         continue  # 跳过这次循环
                 
-                # 动作平滑处理
-                smoothed_joint_action = self.action_smoother.smooth_action(joint_action)
+                # 动作平滑处理（如果启用）
+                if self.action_smoother is not None:
+                    smoothed_joint_action = self.action_smoother.smooth_action(joint_action)
+                else:
+                    smoothed_joint_action = joint_action
                 
                 # 执行动作
                 interface.execute_action(smoothed_joint_action)
@@ -667,8 +795,9 @@ class ACTInferenceRunner:
             import traceback
             traceback.print_exc()
         finally:
-            # 打印动作平滑统计信息
-            self.action_smoother.print_statistics()
+            # 打印动作平滑统计信息（如果启用）
+            if self.action_smoother is not None:
+                self.action_smoother.print_statistics()
             
             # 停止策略接口
             if 'interface' in locals():
@@ -685,7 +814,7 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="基于相机和ACT模型的实时推理脚本 - 更新版本")
     parser.add_argument("--model_path", type=str, 
-                       default="/home/robotflow/model/1/060000/pretrained_model",
+                       default="/home/robotflow/Downloads/new_model/act_2cam_dino_lora/checkpoints/060000/pretrained_model",
                        help="训练好的模型路径")
     parser.add_argument("--device", type=str, default="cuda",
                        help="计算设备 (cpu/cuda)")
@@ -700,9 +829,34 @@ def main():
                        help="推理频率 (Hz) - 针对130ms推理时间优化")
     parser.add_argument("--debug_image", action="store_true", default=False,
                        help="显示图像处理调试信息")
-    parser.add_argument("--use_eih", action="store_true", default=True,  # 新增
-                       help="使用eye-in-hand视角作为输入")
+    parser.add_argument("--dino_model_dir", type=str, default="/home/robotflow/Downloads/dinov3-vits/dinov3-vitb16-pretrain-lvd1689m",
+                       help="DINOv3模型目录路径")
+    parser.add_argument("--vision_backbone", type=str, default="dinov3_vitb16",
+                       help="视觉backbone类型 (dinov3_vits16, dinov3_vitb16, dinov3_vitl16)")
+    parser.add_argument("--use_dual_cam", action="store_true", default=True,
+                       help="使用双视角模式 (cam_0 + cam_1)")
+    parser.add_argument("--use_single_cam", action="store_true", default=False,
+                       help="使用单视角模式 (仅cam_0，cam_1使用相同图像)")
+    parser.add_argument("--enable_action_smoother", action="store_true", default=True,
+                       help="启用动作平滑器来检测和平滑突变动作")
+    parser.add_argument("--save_images", action="store_true", default=True,
+                       help="保存推理过程中的原始图像和预处理后的图像")
     args = parser.parse_args()
+    
+    # 处理相机模式参数
+    # 如果显式指定了use_single_cam，则使用单视角模式
+    # 如果显式指定了use_dual_cam，则使用双视角模式
+    # 如果都没有指定，默认使用双视角模式（因为模型是用双视角训练的）
+    if args.use_single_cam:
+        use_dual_cam = False
+        print("使用单视角模式（仅cam_0，cam_1使用相同图像）")
+    elif args.use_dual_cam:
+        use_dual_cam = True
+        print("使用双视角模式（cam_0 + cam_1）")
+    else:
+        # 默认使用双视角模式
+        use_dual_cam = True
+        print("默认使用双视角模式（cam_0 + cam_1）")
     
     # 检查配置文件
     if not os.path.exists(args.config_path):
@@ -724,7 +878,11 @@ def main():
             test_mode=args.test_mode,
             frequency=args.frequency,
             debug_image=args.debug_image,
-            use_eih=args.use_eih
+            dino_model_dir=args.dino_model_dir,
+            vision_backbone=args.vision_backbone,
+            use_dual_cam=use_dual_cam,
+            enable_action_smoother=args.enable_action_smoother,
+            save_images=args.save_images
         )
         
         # 执行推理

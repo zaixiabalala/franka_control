@@ -229,79 +229,86 @@ class WSGController(mp.Process):
                             'measure_timestamp': time.time()
                         }
                         
-                        # 【简化版】基于绝对宽度的三段式判断
+                        # 【核心修改】智能判断使用 move 还是 grasp
                         target_width_m = target_pos / self.scale
                         current_width_m = current_width
+                        width_change = target_width_m - current_width_m
                         
-                        # 三段式判断：
-                        # 1. target < 35mm → GRASP 区域（抓取/保持）
-                        # 2. target > 40mm → RELEASE 区域（松开）
-                        # 3. 35-40mm → 过渡区（保持当前状态）
+                        # 【优先级1】判断是否应该松开（最高优先级）
+                        # 明确的松开条件：目标宽度超过松开阈值（默认 40mm）
+                        should_release = (
+                            is_grasping and 
+                            target_width_m > self.release_width_threshold
+                        )
                         
-                        in_grasp_zone = target_width_m < self.grasp_keep_threshold  # < 35mm
-                        in_release_zone = target_width_m > self.release_width_threshold  # > 40mm
+                        if should_release:
+                            # 明确的松开动作，退出抓取状态
+                            is_grasping = False
+                            if self.verbose:
+                                print(f"[WSGController] ✓ 松开物体: 目标={target_width_m*1000:.1f}mm > {self.release_width_threshold*1000:.1f}mm")
                         
-                        # ===== 状态机逻辑 =====
-                        if in_release_zone:
-                            # 【情况1】目标宽度 > 40mm → 松开区域
-                            if is_grasping:
-                                is_grasping = False
-                                if self.verbose:
-                                    print(f"[WSGController] ✓ 松开物体: 目标={target_width_m*1000:.1f}mm > {self.release_width_threshold*1000:.1f}mm")
-                            # 执行 MOVE 张开
-                            if self.verbose and iter_idx % 30 == 0:
-                                print(f"[WSGController] MOVE 张开: 目标={target_width_m*1000:.1f}mm")
-                            wsg.move_gripper_to_width(target_width_m)
+                        # 【优先级2】判断是否应该使用 grasp
+                        # 1. 新的闭合动作：大幅度闭合触发
+                        # 2. 保持抓取：已经在抓取且目标宽度仍然较小（< grasp_keep_threshold）
+                        should_use_grasp = (
+                            self.use_grasp_for_closing and
+                            not should_release and  # 如果正在松开，则不 grasp
+                            (width_change < -self.grasp_threshold or  # 大幅闭合
+                             (is_grasping and target_width_m < self.grasp_keep_threshold))  # 或保持抓取
+                        )
+                        
+                        if should_use_grasp:
+                            # 使用 grasp：接触即停止，适合抓取物体
                             
-                        elif in_grasp_zone:
-                            # 【情况2】目标宽度 < 35mm → 抓取区域
-                            if self.use_grasp_for_closing:
-                                if not is_grasping:
-                                    # 第一次进入抓取状态
-                                    is_grasping = True
+                            # 【关键修改】只在第一次进入抓取状态时调用 grasp
+                            # 之后不再调用，让 grasp 持续保持力
+                            if not is_grasping:
+                                # 第一次进入抓取状态
+                                is_grasping = True
+                                grasp_engaged_width = target_width_m
+                                
+                                if self.verbose:
+                                    print(f"[WSGController] ✓ 初次抓取: 目标={target_width_m*1000:.1f}mm, "
+                                          f"当前={current_width_m*1000:.1f}mm, "
+                                          f"速度={self.grasp_speed*1000:.1f}mm/s, "
+                                          f"力={self.grasp_force:.1f}N")
+                                
+                                # 只调用一次 grasp
+                                try:
+                                    result = wsg.grasp_gripper(
+                                        width=target_width_m,
+                                        speed=self.grasp_speed,
+                                        force=self.grasp_force,
+                                        epsilon_inner=self.grasp_epsilon_inner,
+                                        epsilon_outer=self.grasp_epsilon_outer
+                                    )
                                     if self.verbose:
-                                        print(f"[WSGController] ✓ 初次抓取: 目标={target_width_m*1000:.1f}mm, "
-                                              f"当前={current_width_m*1000:.1f}mm, "
-                                              f"速度={self.grasp_speed*1000:.1f}mm/s, "
-                                              f"力={self.grasp_force:.1f}N")
-                                    
-                                    # 只调用一次 grasp
-                                    try:
-                                        result = wsg.grasp_gripper(
-                                            width=target_width_m,
-                                            speed=self.grasp_speed,
-                                            force=self.grasp_force,
-                                            epsilon_inner=self.grasp_epsilon_inner,
-                                            epsilon_outer=self.grasp_epsilon_outer
-                                        )
-                                        if self.verbose:
-                                            print(f"[WSGController] Grasp 命令已发送: {result}")
-                                    except (AttributeError, TypeError) as e:
-                                        if self.verbose:
-                                            print(f"[WSGController] 警告: Grasp调用失败，降级使用 move")
-                                        wsg.move_gripper_to_width(target_width_m)
-                                else:
-                                    # 保持抓取状态，不调用任何命令
-                                    if self.verbose and iter_idx % 90 == 0:
-                                        print(f"[WSGController] 保持抓取: 当前宽度={current_width_m*1000:.1f}mm, "
-                                              f"持续施加 {self.grasp_force:.1f}N 的力")
+                                        print(f"[WSGController] Grasp 命令已发送: {result}")
+                                except (AttributeError, TypeError) as e:
+                                    if self.verbose:
+                                        print(f"[WSGController] 警告: Grasp调用失败 ({type(e).__name__}: {e})，降级使用 move")
+                                    wsg.move_gripper_to_width(target_width_m)
                             else:
-                                # 未启用 grasp，使用 move
-                                if self.verbose and iter_idx % 30 == 0:
-                                    print(f"[WSGController] MOVE: 目标={target_width_m*1000:.1f}mm")
-                                wsg.move_gripper_to_width(target_width_m)
-                        
+                                # 已经在抓取状态，不再调用 grasp，让底层保持持续施力
+                                if self.verbose and iter_idx % 90 == 0:  # 每 3 秒打印一次
+                                    print(f"[WSGController] 保持抓取: 当前宽度={current_width_m*1000:.1f}mm, "
+                                          f"持续施加 {self.grasp_force:.1f}N 的力")
                         else:
-                            # 【情况3】35-40mm 过渡区域
+                            # 使用 move：精确到达目标宽度，适合张开或小幅调整
+                            # 【重要保护】如果正在抓取但不满足 should_use_grasp，不执行任何命令
+                            # 避免误调用 move 中断 grasp
                             if is_grasping:
-                                # 在抓取状态下，保持不动（避免误松开）
+                                # 理论上不应该到这里（should_use_grasp 应该为 True）
+                                # 如果到了这里，说明逻辑有问题，保持抓取，不调用 move
                                 if self.verbose and iter_idx % 90 == 0:
-                                    print(f"[WSGController] 过渡区保持抓取: 目标={target_width_m*1000:.1f}mm "
-                                          f"({self.grasp_keep_threshold*1000:.1f}-{self.release_width_threshold*1000:.1f}mm)")
+                                    print(f"[WSGController] 警告: 抓取状态但不满足 grasp 条件，保持不动 "
+                                          f"(目标={target_width_m*1000:.1f}mm)")
                             else:
-                                # 非抓取状态下，正常 MOVE
-                                if self.verbose and iter_idx % 30 == 0:
-                                    print(f"[WSGController] 过渡区 MOVE: 目标={target_width_m*1000:.1f}mm")
+                                # 正常的 move 操作（张开、微调等）
+                                if self.verbose and iter_idx % 30 == 0 and abs(width_change) > 0.001:
+                                    print(f"[WSGController] 使用 MOVE: 目标={target_width_m*1000:.1f}mm, "
+                                          f"当前={current_width_m*1000:.1f}mm, "
+                                          f"变化={width_change*1000:.1f}mm")
                                 wsg.move_gripper_to_width(target_width_m)
                         
                         last_gripper_width = current_width_m
